@@ -62,89 +62,35 @@ jobs:
           echo "trans_html_url=$TRANS_HTML_URL" >> $GITHUB_OUTPUT
 
       - name: Download Tools (apkeep, APKEditor, LSPatch)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -Eeuo pipefail
           mkdir -p tools
-
-          download_asset() {
-            local url="$1"
-            local output="$2"
-            echo "Downloading $(basename "$output") from: $url"
-            rm -f "$output"
-            if ! curl --fail --location --silent --show-error \
-              --retry 4 --retry-all-errors --retry-delay 2 \
-              --connect-timeout 20 --max-time 600 \
-              "$url" --output "$output"; then
-              rm -f "$output"
-              echo "::error::Download failed for $(basename "$output"). Check the URL/status above."
-              return 1
-            fi
-            if [[ ! -s "$output" ]]; then
-              echo "::error::Downloaded file is empty: $output"
-              return 1
-            fi
-          }
-
-          github_api() {
-            curl --fail --location --silent --show-error \
-              --retry 4 --retry-all-errors --retry-delay 2 \
-              --connect-timeout 20 --max-time 60 \
-              -H "Accept: application/vnd.github+json" \
-              -H "X-GitHub-Api-Version: 2022-11-28" \
-              -H "Authorization: Bearer $GH_TOKEN" "$1"
-          }
-
-          # 1. apkeep: resolve the Linux x86_64 asset from release metadata.
-          # Do not guess a musl filename: the current release publishes GNU builds.
-          APKEEP_JSON="$(github_api https://api.github.com/repos/EFForg/apkeep/releases/latest)"
-          APKEEP_URL="$(printf '%s' "$APKEEP_JSON" | jq -r '[.assets[]? | select(.name == "apkeep-x86_64-unknown-linux-gnu") | .browser_download_url] | first // empty')"
-          APKEEP_SHA="$(printf '%s' "$APKEEP_JSON" | jq -r '[.assets[]? | select(.name == "apkeep-x86_64-unknown-linux-gnu") | .digest] | first // empty')"
-          if [[ -z "$APKEEP_URL" || "$APKEEP_URL" == "null" ]]; then
-            echo "::error::No apkeep x86_64 GNU asset in the latest release. Available assets:"
-            printf '%s\n' "$APKEEP_JSON" | jq -r '.assets[]?.name'
-            exit 1
-          fi
-          download_asset "$APKEEP_URL" tools/apkeep
+          
+          # 1. apkeep
+          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-musl -O tools/apkeep || \
+          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O tools/apkeep
           chmod +x tools/apkeep
-          if [[ "$APKEEP_SHA" =~ ^sha256:([a-fA-F0-9]{64})$ ]]; then
-            echo "${BASH_REMATCH[1]}  tools/apkeep" | sha256sum -c -
+
+          # 2. APKEditor: follow Kajaqq/gaku-patcher and use the current release.
+          APKEDITOR_URL=$(curl -fsSL https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '[.assets[]? | select(.name | ascii_downcase | endswith(".jar")) | .browser_download_url] | first // empty')
+          if [ -z "$APKEDITOR_URL" ] || [ "$APKEDITOR_URL" = "null" ]; then
+            echo "::error::Could not find the latest APKEditor JAR release asset."
+            exit 1
+          fi
+          wget -q "$APKEDITOR_URL" -O tools/APKEditor.jar
+
+          # 3. LSPatch (JingMatrix)
+          LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".jar")) | .browser_download_url] | first // empty')
+          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
+            LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".zip")) | .browser_download_url] | first // empty')
+            wget -q "$LSPATCH_URL" -O tools/lspatch.zip
+            unzip -q -j tools/lspatch.zip "*.jar" -d tools/
+            mv tools/*.jar tools/lspatch.jar 2>/dev/null || true
           else
-            echo "::warning::GitHub did not provide a SHA-256 digest for apkeep; checking that it is an executable ELF binary."
-          fi
-          file tools/apkeep
-          if ! file tools/apkeep | grep -q 'ELF 64-bit.*x86-64'; then
-            echo "::error::Downloaded apkeep is not an x86_64 Linux ELF executable."
-            exit 1
+            wget -q "$LSPATCH_URL" -O tools/lspatch.jar
           fi
 
-          # 2. APKEditor: resolve the JAR and its digest from the official latest release.
-          APKEDITOR_JSON="$(github_api https://api.github.com/repos/REAndroid/APKEditor/releases/latest)"
-          APKEDITOR_ASSET="$(printf '%s' "$APKEDITOR_JSON" | jq -c '[.assets[]? | select(.name | ascii_downcase | endswith(".jar"))][0] // empty')"
-          if [[ -z "$APKEDITOR_ASSET" || "$APKEDITOR_ASSET" == "null" ]]; then
-            echo "::error::Could not find the latest APKEditor JAR asset. Available assets:"
-            printf '%s\n' "$APKEDITOR_JSON" | jq -r '.assets[]?.name'
-            exit 1
-          fi
-          APKEDITOR_URL="$(printf '%s' "$APKEDITOR_ASSET" | jq -r '.browser_download_url')"
-          APKEDITOR_SHA="$(printf '%s' "$APKEDITOR_ASSET" | jq -r '.digest // empty')"
-          download_asset "$APKEDITOR_URL" tools/APKEditor.jar
-          if [[ "$APKEDITOR_SHA" =~ ^sha256:([a-fA-F0-9]{64})$ ]]; then
-            echo "${BASH_REMATCH[1]}  tools/APKEditor.jar" | sha256sum -c -
-          fi
-          jar tf tools/APKEditor.jar >/dev/null
-
-          # 3. LSPatch: pinned stable release with the known SHA-256 digest.
-          # curl provides HTTP status/errors and retries transient GitHub failures;
-          # wget's quiet mode hid which asset returned HTTP 404/403 on the failed run.
-          LSPATCH_URL="https://github.com/JingMatrix/LSPatch/releases/download/v1.2-487/lspatch-v1.2-487-release.jar"
-          download_asset "$LSPATCH_URL" tools/lspatch.jar
-          echo "d238fdc414d121b7fa454d8b4ccf420df3a8c97d563761861ff92bd9c5da2165  tools/lspatch.jar" | sha256sum -c -
-          jar tf tools/lspatch.jar >/dev/null
-
-          echo "All tool downloads and archive checks passed:"
           ls -lh tools/
+
       - name: Check Google Play Game Version
         id: gplay
         run: |
@@ -160,7 +106,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg8"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg4"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -183,7 +129,7 @@ jobs:
           path: clean_game/gaku_merged.apk
           # Bump this key when changing the split-download/merge pipeline so an old
           # merged APK without native libraries cannot be restored from cache.
-          key: gakumas-clean-apk-v4-${{ steps.gplay.outputs.game_ver }}
+          key: gakumas-clean-apk-v3-${{ steps.gplay.outputs.game_ver }}
 
       - name: Download & Merge Google Play Splits (upstream-compatible)
         if: steps.compare.outputs.should_build == 'true' && steps.cache-game.outputs.cache-hit != 'true'
@@ -229,18 +175,13 @@ jobs:
           echo "APKEditor input directory: $APP_SPLITS_DIR"
           printf 'Downloaded APK: %s\n' "${SPLIT_APKS[@]}"
 
-          # Verify both libraries before patching. Localify's native initHook() opens
-          # libil2cpp.so using ApplicationInfo.nativeLibraryDir/libil2cpp.so.
+          # Fail before patching if the original split set does not include the
+          # game engine's ARM64 library. This pinpoints a download/merge problem.
           HAS_MAIN_IN_INPUT=false
-          HAS_IL2CPP_IN_INPUT=false
           for apk in "${SPLIT_APKS[@]}"; do
             if unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libmain.so' >/dev/null; then
               HAS_MAIN_IN_INPUT=true
               echo "Found lib/arm64-v8a/libmain.so in source split: $apk"
-            fi
-            if unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libil2cpp.so' >/dev/null; then
-              HAS_IL2CPP_IN_INPUT=true
-              echo "Found lib/arm64-v8a/libil2cpp.so in source split: $apk"
             fi
           done
           if [[ "$HAS_MAIN_IN_INPUT" != true ]]; then
@@ -248,54 +189,31 @@ jobs:
             echo "This is a source-download/configuration issue; patching cannot restore a library that was never downloaded."
             exit 1
           fi
-          if [[ "$HAS_IL2CPP_IN_INPUT" != true ]]; then
-            echo "::error::The downloaded APK set contains no lib/arm64-v8a/libil2cpp.so, which Localify passes to initHook()."
-            exit 1
-          fi
 
-          # IMPORTANT: with extractNativeLibs=false, Android can load .so files directly
-          # from the APK without creating files in nativeLibraryDir. Localify passes the
-          # filesystem path nativeLibraryDir/libil2cpp.so to initHook(), so extraction
-          # must be enabled to make that path exist after installation.
+          # APKEditor merge step, as in Kajaqq/gaku-patcher and the fullpie project.
+          # Keep native libraries uncompressed and aligned as requested by the manifest.
           java -jar tools/APKEditor.jar m \
             -i "$APP_SPLITS_DIR" \
             -o clean_game/gaku_merged.apk \
-            -extractNativeLibs true
+            -extractNativeLibs false
 
           python3 - <<'PYVERIFY'
           import sys, zipfile
           apk_path = "clean_game/gaku_merged.apk"
-          required_files = (
-              "lib/arm64-v8a/libmain.so",
-              "lib/arm64-v8a/libil2cpp.so",
-          )
+          required = "lib/arm64-v8a/libmain.so"
           try:
               with zipfile.ZipFile(apk_path) as apk:
                   entries = {item.filename: item for item in apk.infolist()}
-                  native = [n for n in entries if n.startswith("lib/") and n.endswith(".so")]
-                  for required in required_files:
-                      item = entries.get(required)
-                      if item is None or item.file_size == 0:
-                          print(f"ERROR: {required} is absent/empty after APKEditor merge", file=sys.stderr)
-                          print("Merged native libraries:", *native[:100], sep="\n", file=sys.stderr)
-                          raise SystemExit(1)
-                      print(f"Verified merged {required}: {item.file_size:,} bytes; compression={item.compress_type}")
+                  item = entries.get(required)
+                  if item is None or item.file_size == 0:
+                      native = [n for n in entries if n.startswith("lib/") and n.endswith(".so")]
+                      print(f"ERROR: {required} is absent/empty after APKEditor merge", file=sys.stderr)
+                      print("Merged native libraries:", *native[:100], sep="\n", file=sys.stderr)
+                      raise SystemExit(1)
+                  print(f"Verified merged {required}: {item.file_size:,} bytes; compression={item.compress_type}")
           except zipfile.BadZipFile as exc:
               raise SystemExit(f"ERROR: APKEditor produced an invalid APK: {exc}")
           PYVERIFY
-
-          # Verify the binary manifest explicitly enables extraction. If this is false,
-          # the game may run and load the Xposed module while Localify's native hook fails
-          # to open the target libil2cpp.so at nativeLibraryDir/libil2cpp.so.
-          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
-          "$BUILD_TOOLS/aapt" dump xmltree clean_game/gaku_merged.apk AndroidManifest.xml > merged_manifest.xmltree
-          EXTRACT_NATIVE_LINE="$(grep -m1 'android:extractNativeLibs' merged_manifest.xmltree || true)"
-          if [[ -z "$EXTRACT_NATIVE_LINE" ]] || ! grep -Eq '0xffffffff|true' <<< "$EXTRACT_NATIVE_LINE"; then
-            echo "::error::Merged APK manifest does not enable android:extractNativeLibs=true."
-            echo "Manifest attribute: ${EXTRACT_NATIVE_LINE:-not present}"
-            exit 1
-          fi
-          echo "Verified android:extractNativeLibs=true: $EXTRACT_NATIVE_LINE"
 
           ls -lh clean_game/gaku_merged.apk
 
@@ -417,67 +335,6 @@ jobs:
           program_model.write_text(program_text, encoding="utf-8")
           print(f"Set {program_model}: useAPIAssetsURL={ru_api}")
 
-          # Keep the upstream Localify configuration handshake intact. Since the
-          # standalone Localify app is installed alongside the game, GakumasHookMain
-          # must retain requestConfig() and loadConfig(gkmsData) exactly as upstream
-          # expects. Do not replace these calls with a synthetic config: that can
-          # bypass the installed app's settings and alter initialization order.
-          hook_files = list((root / "app/src/main/java").rglob("GakumasHookMain.kt"))
-          if len(hook_files) != 1:
-              raise SystemExit(f"Expected one GakumasHookMain.kt, found {len(hook_files)}")
-          hook_path = hook_files[0]
-          hook_text = hook_path.read_text(encoding="utf-8")
-          if hook_text.count("requestConfig(app.applicationContext)") != 1:
-              raise SystemExit("Upstream requestConfig(app.applicationContext) flow is missing or changed")
-          if hook_text.count("loadConfig(gkmsData)") != 1:
-              raise SystemExit("Upstream loadConfig(gkmsData) flow is missing or changed")
-
-          # Add diagnostics only: retain the original FilesChecker/initHook order and
-          # arguments. The toast happens before these calls, so it does not prove that
-          # assets were copied or that the native hooks initialized successfully.
-          asset_marker = "FilesChecker.initDir(app.filesDir, modulePath)"
-          asset_diagnostic = '''FilesChecker.initDir(app.filesDir, modulePath)
-              val localifyAssetRoot = File(app.filesDir, FilesChecker.localizationFilesDir)
-              val ruLocalizationFile = File(localifyAssetRoot, "local-files/localization.json")
-              val ruGenericFile = File(localifyAssetRoot, "local-files/generic.json")
-              val ruVersionFile = File(localifyAssetRoot, "version.txt")
-              val ruVersionText = runCatching { if (ruVersionFile.isFile) ruVersionFile.readText().trim() else "missing" }.getOrDefault("unreadable")
-              Log.i(TAG, "Localify asset check: root=${localifyAssetRoot.absolutePath}, localization=${ruLocalizationFile.isFile} (${ruLocalizationFile.length()} bytes), generic=${ruGenericFile.isFile} (${ruGenericFile.length()} bytes), version=$ruVersionText")'''
-          asset_count = hook_text.count(asset_marker)
-          if asset_count != 1:
-              raise SystemExit(f"Expected one FilesChecker.initDir call, found {asset_count}")
-          hook_text = hook_text.replace(asset_marker, asset_diagnostic, 1)
-
-          # Log the actual library path before calling the upstream native initializer,
-          # then log return. No hook args or lifecycle conditions are changed.
-          init_pattern = re.compile(
-              r'(?m)^([ \t]*)initHook\([ \t]*\n[ \t]*"\$\{app\.applicationInfo\.nativeLibraryDir\}/libil2cpp\.so",[ \t]*\n[ \t]*File\([ \t]*\n[ \t]*app\.filesDir\.absolutePath,[ \t]*\n[ \t]*FilesChecker\.localizationFilesDir[ \t]*\n[ \t]*\)\.absolutePath[ \t]*\n[ \t]*\)'
-          )
-          def instrument_init(match):
-              indent = match.group(1)
-              original_call = match.group(0)
-              return (
-                  f'{indent}Log.i(TAG, "Localify initHook begin: il2cpp=" + app.applicationInfo.nativeLibraryDir + "/libil2cpp.so, localizationRoot=" + File(app.filesDir, FilesChecker.localizationFilesDir).absolutePath)\n'
-                  + original_call
-                  + f'\n{indent}Log.i(TAG, "Localify initHook call returned")'
-              )
-          hook_text, init_count = init_pattern.subn(instrument_init, hook_text)
-          if init_count != 1:
-              raise SystemExit(f"Expected one upstream initHook call to instrument, found {init_count}")
-
-          # Confirm the upstream config handoff remains present. This log is
-          # observational only; loadConfig still receives the original gkmsData.
-          config_diag = '''loadConfig(gkmsData)
-              Log.i(TAG, "Localify config handoff: gkmsData received; localData=${programData != null}, configLength=${gkmsData.length}")'''
-          hook_text, config_count = re.subn(r'\bloadConfig\(gkmsData\)', lambda _: config_diag, hook_text, count=1)
-          if config_count != 1:
-              raise SystemExit("Could not add the config-handoff diagnostic without changing the upstream call")
-          if hook_text.count("loadConfig(gkmsData)") != 1:
-              raise SystemExit("Instrumentation changed the upstream native config handoff")
-
-          hook_path.write_text(hook_text, encoding="utf-8")
-          print(f"Instrumented {hook_path} without replacing requestConfig/loadConfig flow")
-
           # Also replace the fallback URL used when the saved URL is empty.
           values_dir = root / "app/src/main/res"
           string_resources = list(values_dir.glob("values*/strings.xml"))
@@ -533,7 +390,6 @@ jobs:
           print(f"  bundled files: {sum(1 for p in (target_assets / 'local-files').rglob('*') if p.is_file())}")
           print("  checkBuiltInAssets=false, useRemoteAssets=false, useAPIAssets=true, RU API URL set")
           print("  lazyInit=false, useMasterTrans=true, replaceTexture=false, useAPITextureAssets=false")
-          print("  upstream TranslucentActivity/requestConfig handoff retained; initHook and asset-copy diagnostics added")
           PYCONFIG
 
           chmod +x gradlew
@@ -571,8 +427,7 @@ jobs:
           apk_path, expected_url = sys.argv[1], sys.argv[2]
           with zipfile.ZipFile(apk_path) as apk:
               dex_names = [n for n in apk.namelist() if n.endswith('.dex')]
-              dex_contents = [apk.read(n) for n in dex_names]
-              if not any(expected_url.encode('utf-8') in data for data in dex_contents):
+              if not any(expected_url.encode('utf-8') in apk.read(n) for n in dex_names):
                   raise SystemExit('::error::Russian releases/latest URL is missing from compiled DEX files')
               config_path = 'assets/gakumas-local/localizationConfig.json'
               if config_path in apk.namelist():
@@ -614,15 +469,12 @@ jobs:
           # LSPatch can intentionally use overlapping ZIP ranges for origin.apk;
           # standard ZIP rewrite tools may corrupt that layout. Both referenced
           # upstream workflows publish the direct LSPatch output.
-          echo "Using pinned LSPatch v1.2-487; SHA-256 verified during tool download."
           rm -rf patched_out
           mkdir -p patched_out
           java -jar tools/lspatch.jar clean_game/gaku_merged.apk \
             -m Gakumas-Localify-RU.apk \
-            -o patched_out/ \
-            --add-permission REQUEST_INSTALL_PACKAGES \
-            --force \
-            -k release.jks "$KS_PASS" "$KEY_ALIAS" "$KEY_PASS"
+            -k release.jks "$KS_PASS" "$KEY_ALIAS" "$KEY_PASS" \
+            -o patched_out/
 
           LSPATCHED_APK="$(find patched_out -type f -name '*-lspatched.apk' -print -quit)"
           if [[ -z "$LSPATCHED_APK" ]]; then
@@ -655,14 +507,12 @@ jobs:
             * **Версия игры (Google Play):** `${{ steps.gplay.outputs.game_ver }}`
             * **Версия перевода (Gakumas-Translation-Data-RU):** [`${{ steps.check_upstreams.outputs.trans_tag }}`](${{ steps.check_upstreams.outputs.trans_html_url }})
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
-            * **LSPatch:** pinned `v1.2-487` (SHA-256 verified)
-            * **Native library extraction:** enabled, required by Localify's `nativeLibraryDir/libil2cpp.so` init path
 
             #### Установка:
-            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`** и **`Gakumas-Localify-RU.apk`**. Русский набор встроен в модуль; установленный Localify сохраняет штатную передачу настроек.
-            2. Откройте Localify и запускайте игру через него, чтобы штатный `TranslucentActivity` передал игровые настройки. Встроенные ресурсы остаются резервным набором.
+            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; для начального запуска не нужны Shizuku, ручной патчинг или отдельная установка менеджера.
+            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API. URL русского API уже установлен по умолчанию.
 
-            Настройки по умолчанию: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен. Конфигурация передаётся штатным механизмом Localify; в логе доступны отдельные отметки копирования ресурсов и вызова initHook.
+            Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен, Resource Update From API включён и указывает на Gakumas-Translation-Data-RU.
           files: |
             Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk
             Gakumas-Localify-RU.apk
