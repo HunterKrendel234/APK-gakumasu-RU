@@ -1,0 +1,325 @@
+name: Auto Patch Gakumas RU
+
+on:
+  schedule:
+    # Проверка обновлений игры, плагина chinosk6 и русского перевода каждые 6 часов
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Принудительно пересобрать APK (даже если версии не менялись)'
+        required: false
+        default: false
+        type: boolean
+  repository_dispatch:
+    types: [translation-updated]
+
+permissions:
+  contents: write
+
+jobs:
+  build-patched-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Check Upstream Versions (Localify & RU Translation)
+        id: check_upstreams
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Получаем последний релиз chinosk6/gakuen-imas-localify
+          PLUGIN_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases/latest)
+          PLUGIN_TAG=$(echo "$PLUGIN_JSON" | jq -r '.tag_name')
+          PLUGIN_URL=$(echo "$PLUGIN_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
+          PLUGIN_HTML_URL=$(echo "$PLUGIN_JSON" | jq -r '.html_url')
+
+          # 2. Получаем последний релиз HunterKrendel234/Gakumas-Translation-Data-RU
+          TRANS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest)
+          TRANS_TAG=$(echo "$TRANS_JSON" | jq -r '.tag_name')
+          TRANS_HTML_URL=$(echo "$TRANS_JSON" | jq -r '.html_url')
+          # Ищем прикрепленный .zip ассет, а если его нет — берем zipball самого релиза
+          TRANS_URL=$(echo "$TRANS_JSON" | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' | head -n 1)
+          if [ -z "$TRANS_URL" ] || [ "$TRANS_URL" = "null" ]; then
+            TRANS_URL=$(echo "$TRANS_JSON" | jq -r '.zipball_url')
+          fi
+
+          echo "Plugin: $PLUGIN_TAG ($PLUGIN_URL)"
+          echo "Translation: $TRANS_TAG ($TRANS_URL)"
+
+          echo "plugin_tag=$PLUGIN_TAG" >> $GITHUB_OUTPUT
+          echo "plugin_url=$PLUGIN_URL" >> $GITHUB_OUTPUT
+          echo "plugin_html_url=$PLUGIN_HTML_URL" >> $GITHUB_OUTPUT
+          echo "trans_tag=$TRANS_TAG" >> $GITHUB_OUTPUT
+          echo "trans_url=$TRANS_URL" >> $GITHUB_OUTPUT
+          echo "trans_html_url=$TRANS_HTML_URL" >> $GITHUB_OUTPUT
+
+      - name: Download Tools (apkeep, APKEditor, LSPatch 0.7)
+        run: |
+          mkdir -p tools
+          # 1. apkeep для скачивания напрямую из Google Play
+          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O tools/apkeep
+          chmod +x tools/apkeep
+
+          # 2. APKEditor для склейки Split APKs в единый APK
+          wget -q https://github.com/REAndroid/APKEditor/releases/download/V1.4.1/APKEditor-1.4.1.jar -O tools/APKEditor.jar
+
+          # 3. LSPatch v0.7 (435) от JingMatrix (поддержка Android 15/16 и API 93)
+          wget -q https://github.com/JingMatrix/LSPatch/releases/download/v0.7/jar-v0.7-435-release.zip -O tools/lspatch.zip
+          unzip -q -j tools/lspatch.zip "*.jar" -d tools/
+          mv tools/jar-*.jar tools/lspatch.jar
+
+      - name: Check Google Play Game Version & Download Splits
+        id: gplay
+        run: |
+          mkdir -p gplay_splits
+          # Проверяем актуальную версию игры в Google Play через apkeep (-l)
+          GAME_VER=$(./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen -d google-play -e "${{ secrets.GPLAY_EMAIL }}" -t "${{ secrets.GPLAY_AAS_TOKEN }}" -l | tail -n 1 | awk '{print $NF}' | tr -d '\r')
+          echo "Актуальная версия игры в Google Play: $GAME_VER"
+          echo "game_ver=$GAME_VER" >> $GITHUB_OUTPUT
+
+      - name: Compare with Latest Published Release
+        id: compare
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CLEAN_GAME=$(echo "${{ steps.gplay.outputs.game_ver }}" | tr -cd 'a-zA-Z0-9._-')
+          CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
+          CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
+
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}"
+          echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
+          echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
+          echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
+          echo "clean_trans=$CLEAN_TRANS" >> $GITHUB_OUTPUT
+
+          LAST_TAG=$(gh release view --json tagName -q '.tagName' 2>/dev/null || echo "none")
+          echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
+          echo "Последний собранный релиз: $LAST_TAG"
+          echo "Текущая комбинация версий: $COMBINED_TAG"
+
+          if [ "$LAST_TAG" = "$COMBINED_TAG" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
+            echo "Обновлений нет. Сборка не требуется."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Обнаружено обновление! Начинаем сборку."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cache Merged Clean Game APK
+        if: steps.compare.outputs.should_build == 'true'
+        id: cache-game
+        uses: actions/cache@v4
+        with:
+          path: clean_game/gaku_merged.apk
+          key: gakumas-clean-apk-${{ steps.gplay.outputs.game_ver }}
+
+      - name: Download & Merge Game Splits (if not cached)
+        if: steps.compare.outputs.should_build == 'true' && steps.cache-game.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p gplay_splits clean_game
+          ./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen \
+            -d google-play \
+            -e "${{ secrets.GPLAY_EMAIL }}" \
+            -t "${{ secrets.GPLAY_AAS_TOKEN }}" \
+            -o split_apk=true \
+            ./gplay_splits/
+
+          # Находим папку со скачанными сплитами или сам набор APK и склеиваем через APKEditor
+          SPLIT_DIR=$(find ./gplay_splits -mindepth 1 -maxdepth 1 -type d | head -n 1)
+          if [ -z "$SPLIT_DIR" ]; then SPLIT_DIR="./gplay_splits"; fi
+
+          java -jar tools/APKEditor.jar m -i "$SPLIT_DIR" -o clean_game/gaku_merged.apk
+          ls -lh clean_game/gaku_merged.apk
+
+      - name: Restore Keystore
+        if: steps.compare.outputs.should_build == 'true'
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > release.jks
+
+      - name: Inject RU Translation into chinosk6 Localify APK
+        if: steps.compare.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 1. Скачиваем оригинальный APK плагина от chinosk6 и архив русского перевода
+          wget -q "${{ steps.check_upstreams.outputs.plugin_url }}" -O localify_orig.apk
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" "${{ steps.check_upstreams.outputs.trans_url }}" -o ru_trans.zip
+
+          mkdir -p work_plugin work_ru
+          unzip -q localify_orig.apk -d work_plugin
+          unzip -q ru_trans.zip -d work_ru
+
+          # Находим корень распакованного перевода (если архив содержит вложенную папку)
+          RU_ROOT="work_ru"
+          if [ ! -d "$RU_ROOT/local-files" ] && [ -z "$(find "$RU_ROOT" -maxdepth 1 -name '*.json')" ]; then
+            SUBDIR=$(find work_ru -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            if [ -n "$SUBDIR" ]; then RU_ROOT="$SUBDIR"; fi
+          fi
+
+          # 2. Обрабатываем структуру ассетов chinosk6 (папка assets/gakumas-local)
+          TARGET_ASSET_DIR="work_plugin/assets/gakumas-local"
+          mkdir -p "$TARGET_ASSET_DIR/local-files"
+
+          # Сохраняем оригинальные шрифты (.ttf / .otf) из chinosk6 на случай, если в архиве перевода нет своего шрифта
+          mkdir -p saved_fonts
+          find "$TARGET_ASSET_DIR" -type f \( -name "*.ttf" -o -name "*.otf" \) -exec cp {} saved_fonts/ \; 2>/dev/null || true
+
+          # Очищаем старые китайские файлы перевода, но не трогаем структуру шрифтов
+          rm -rf "$TARGET_ASSET_DIR/local-files/"*
+
+          # Копируем русские файлы перевода
+          if [ -d "$RU_ROOT/local-files" ]; then
+            cp -r "$RU_ROOT/local-files/"* "$TARGET_ASSET_DIR/local-files/"
+          else
+            cp -r "$RU_ROOT/"* "$TARGET_ASSET_DIR/local-files/"
+          fi
+
+          # Возвращаем кастомный шрифт chinosk6, если в русском релизе не лежал свой
+          for font in saved_fonts/*; do
+            [ -e "$font" ] || continue
+            fname=$(basename "$font")
+            if [ -z "$(find "$TARGET_ASSET_DIR" -name "$fname")" ]; then
+              cp "$font" "$TARGET_ASSET_DIR/local-files/"
+            fi
+          done
+
+          # 3. Записываем уникальный version.txt, чтобы Localify автоматически распаковал перевод при старте
+          echo "${{ steps.compare.outputs.combined_tag }}" > "$TARGET_ASSET_DIR/version.txt"
+
+          # 4. Обновляем только папку assets/ внутри localify_orig.apk (чтобы не сломать сжатие .so и resources.arsc)
+          cp localify_orig.apk Gakumas-Localify-RU-unsigned.apk
+          zip -q -d Gakumas-Localify-RU-unsigned.apk "assets/gakumas-local/*" "META-INF/*" || true
+          (cd work_plugin && zip -q -r ../Gakumas-Localify-RU-unsigned.apk assets/gakumas-local/)
+
+          # 5. Выравниваем (zipalign) и подписываем нашим ключом
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS/zipalign" -p -f 4 Gakumas-Localify-RU-unsigned.apk Gakumas-Localify-RU.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks release.jks \
+            --ks-pass "pass:${{ secrets.KS_PASS }}" \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --key-pass "pass:${{ secrets.KEY_PASS }}" \
+            Gakumas-Localify-RU.apk
+
+      - name: Patch Game APK with LSPatch (Integrated Mode)
+        if: steps.compare.outputs.should_build == 'true'
+        run: |
+          mkdir -p patched_out
+          java -jar tools/lspatch.jar clean_game/gaku_merged.apk \
+            -m Gakumas-Localify-RU.apk \
+            -k release.jks "${{ secrets.KS_PASS }}" "${{ secrets.KEY_ALIAS }}" "${{ secrets.KEY_PASS }}" \
+            -o patched_out/
+
+          mv patched_out/*-lspatched.apk "Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
+          ls -lh "Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
+
+      - name: Publish GitHub Release
+        if: steps.compare.outputs.should_build == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.compare.outputs.combined_tag }}
+          name: "Gakumas RU (${{ steps.gplay.outputs.game_ver }} | RU ${{ steps.check_upstreams.outputs.trans_tag }})"
+          body: |
+            ### Готовый APK Gakuen Idolmaster с вшитым русским переводом и Localify
+            * **Версия игры (Google Play):** `${{ steps.gplay.outputs.game_ver }}`
+            * **Версия перевода (Gakumas-Translation-Data-RU):** [`${{ steps.check_upstreams.outputs.trans_tag }}`](${{ steps.check_upstreams.outputs.trans_html_url }})
+            * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
+
+            #### Установка:
+            1. Скачайте и установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`** (Shizuku и ручной патчинг **не требуются**, перевод и шрифт уже вшиты внутрь).
+            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`**, если хотите менять настройки графики, 60 FPS, ориентацию экрана или подгружать обновления перевода без переустановки игры.
+          files: |
+            Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk
+            Gakumas-Localify-RU.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send Discord Notification
+        if: steps.compare.outputs.should_build == 'true'
+        env:
+          WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          LAST_TAG="${{ steps.compare.outputs.last_tag }}"
+          CUR_GAME="${{ steps.compare.outputs.clean_game }}"
+          CUR_PLUGIN="${{ steps.compare.outputs.clean_plugin }}"
+          CUR_TRANS="${{ steps.compare.outputs.clean_trans }}"
+
+          CHANGES=""
+          if [ "$LAST_TAG" = "none" ]; then
+            CHANGES="🎉 **Первый автоматический релиз готового APK!**"
+          else
+            OLD_GAME=$(echo "$LAST_TAG" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\1/p')
+            OLD_PLUGIN=$(echo "$LAST_TAG" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\2/p')
+            OLD_TRANS=$(echo "$LAST_TAG" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\3/p')
+
+            if [ "$OLD_GAME" != "$CUR_GAME" ]; then
+              CHANGES="${CHANGES}🎮 **Обновилась игра в Google Play:** \`${OLD_GAME:-?}\` ➔ \`${CUR_GAME}\`\n"
+            fi
+            if [ "$OLD_PLUGIN" != "$CUR_PLUGIN" ]; then
+              CHANGES="${CHANGES}🛠️ **Обновился Gakumas Localify (chinosk6):** \`${OLD_PLUGIN:-?}\` ➔ \`${CUR_PLUGIN}\`\n"
+            fi
+            if [ "$OLD_TRANS" != "$CUR_TRANS" ]; then
+              CHANGES="${CHANGES}🇷🇺 **Обновился русский перевод:** \`${OLD_TRANS:-?}\` ➔ \`${CUR_TRANS}\`\n"
+            fi
+            if [ -z "$CHANGES" ]; then
+              CHANGES="🔄 **Принудительная пересборка APK** (версии компонентов не менялись)"
+            fi
+          fi
+
+          # Преобразуем \n в реальные переносы строк для jq
+          CHANGES_FORMATTED=$(printf "%b" "$CHANGES")
+
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ steps.compare.outputs.combined_tag }}"
+          GAME_DL="https://github.com/${{ github.repository }}/releases/download/${{ steps.compare.outputs.combined_tag }}/Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
+          MANAGER_DL="https://github.com/${{ github.repository }}/releases/download/${{ steps.compare.outputs.combined_tag }}/Gakumas-Localify-RU.apk"
+          ORIG_LOCALIFY_URL="${{ steps.check_upstreams.outputs.plugin_html_url }}"
+          TRANS_REL_URL="${{ steps.check_upstreams.outputs.trans_html_url }}"
+
+          jq -n \
+            --arg title "Доступно обновление Gakumas RU (${{ steps.gplay.outputs.game_ver }})" \
+            --arg url "$RELEASE_URL" \
+            --arg changes "$CHANGES_FORMATTED" \
+            --arg game_ver "${{ steps.gplay.outputs.game_ver }}" \
+            --arg trans_ver "${{ steps.check_upstreams.outputs.trans_tag }}" \
+            --arg plugin_ver "${{ steps.check_upstreams.outputs.plugin_tag }}" \
+            --arg rel_url "$RELEASE_URL" \
+            --arg game_dl "$GAME_DL" \
+            --arg mgr_dl "$MANAGER_DL" \
+            --arg orig_loc_url "$ORIG_LOCALIFY_URL" \
+            --arg trans_url "$TRANS_REL_URL" \
+            '{
+              username: "Gakumas Auto-Patcher RU",
+              embeds: [{
+                title: $title,
+                url: $url,
+                color: 16738740,
+                description: $changes,
+                fields: [
+                  { name: "Версия игры", value: ("`" + $game_ver + "`"), inline: true },
+                  { name: "Русский перевод", value: ("[" + $trans_ver + "](" + $trans_url + ")"), inline: true },
+                  { name: "Оригинал Localify", value: ("[" + $plugin_ver + "](" + $orig_loc_url + ")"), inline: true },
+                  {
+                    name: "Ссылки и скачивание",
+                    value: (
+                      "📦 **[Страница нашего релиза APK на GitHub](" + $rel_url + ")**\n" +
+                      "📲 [Скачать готовый APK игры (Gakumas-RU.apk)](" + $game_dl + ")\n" +
+                      "⚙️ [Скачать менеджер Gakumas-Localify-RU.apk](" + $mgr_dl + ")\n" +
+                      "🔗 [Оригинальный релиз chinosk6/gakuen-imas-localify](" + $orig_loc_url + ")"
+                    )
+                  }
+                ],
+                timestamp: (now | todate)
+              }]
+            }' > payload.json
+
+          curl -s -H "Content-Type: application/json" -X POST -d @payload.json "$WEBHOOK_URL"
