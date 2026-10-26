@@ -106,7 +106,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg4"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg5"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -335,6 +335,82 @@ jobs:
           program_model.write_text(program_text, encoding="utf-8")
           print(f"Set {program_model}: useAPIAssetsURL={ru_api}")
 
+          # Integrated LSPatch mode must not require the standalone Localify app to
+          # provide settings via TranslucentActivity. In upstream GakumasHookMain,
+          # requestConfig() launches that separate app; its failure used to fall
+          # back to the literal JSON string "{}" and pass that directly to native
+          # loadConfig(), bypassing the Kotlin model defaults patched above.
+          # Make standalone game launch use the full serialized embedded defaults.
+          hook_files = list((root / "app/src/main/java").rglob("GakumasHookMain.kt"))
+          if len(hook_files) != 1:
+              raise SystemExit(f"Expected one GakumasHookMain.kt, found {len(hook_files)}")
+          hook_path = hook_files[0]
+          hook_text = hook_path.read_text(encoding="utf-8")
+
+          request_pattern = re.compile(
+              r"if\s*\(\s*!gkmsDataInited\s*\)\s*\{\s*requestConfig\(app\.applicationContext\)\s*\}"
+          )
+          request_replacement = '''if (!gkmsDataInited) {
+                  // Standalone/integrated APK startup: use the config compiled into this module.
+                  // If launched by the Localify app, its intent extras are processed by initGkmsConfig
+                  // before UnityPlayer.loadNative, and this fallback is skipped.
+                  val integratedConfig = GakumasConfig()
+                  val integratedConfigJson = kotlinx.serialization.json.Json { encodeDefaults = true }
+                      .encodeToString(GakumasConfig.serializer(), integratedConfig)
+                  loadConfig(integratedConfigJson)
+                  gkmsDataInited = true
+                  Log.i(TAG, "Integrated mode: loaded bundled Localify configuration")
+              }'''
+          hook_text, request_count = request_pattern.subn(request_replacement, hook_text)
+          if request_count != 1:
+              raise SystemExit(
+                  "Could not safely patch the integrated-mode requestConfig() call in "
+                  f"{hook_path}; expected 1 match, found {request_count}. "
+                  "Upstream hook structure changed; refusing to build an unpatched APK."
+              )
+
+          # When the manager does pass configuration, normalize it through the Kotlin
+          # config model and encode defaults explicitly before native code consumes it.
+          # This also protects sparse JSON such as `{}` from disabling native defaults.
+          native_call_pattern = re.compile(r"\bloadConfig\(\s*gkmsData\s*\)")
+          native_call_replacement = '''val nativeConfig = initConfig ?: GakumasConfig()
+              val nativeConfigJson = kotlinx.serialization.json.Json { encodeDefaults = true }
+                  .encodeToString(GakumasConfig.serializer(), nativeConfig)
+              loadConfig(nativeConfigJson)'''
+          hook_text, native_call_count = native_call_pattern.subn(native_call_replacement, hook_text)
+          if native_call_count != 1:
+              raise SystemExit(
+                  f"Expected exactly one loadConfig(gkmsData) call in {hook_path}, found {native_call_count}"
+              )
+
+          if "requestConfig(app.applicationContext)" in hook_text:
+              raise SystemExit("Integrated hook still attempts to launch the standalone Localify app")
+          if "loadConfig(gkmsData)" in hook_text:
+              raise SystemExit("Raw, possibly empty gkmsData is still passed to native loadConfig")
+          if "Integrated mode: loaded bundled Localify configuration" not in hook_text:
+              raise SystemExit("Integrated-mode fallback marker missing after patch")
+
+          # Add runtime diagnostics around the asset-copy stage. The toast saying
+          # libMarryKotone.so loaded proves only the module library was loaded;
+          # this log proves whether the RU files were copied before native hooks run.
+          asset_init_marker = "FilesChecker.initDir(app.filesDir, modulePath)"
+          asset_diagnostic = '''FilesChecker.initDir(app.filesDir, modulePath)
+              val localifyAssetRoot = File(app.filesDir, FilesChecker.localizationFilesDir)
+              val ruLocalizationFile = File(localifyAssetRoot, "local-files/localization.json")
+              val ruGenericFile = File(localifyAssetRoot, "local-files/generic.json")
+              val ruVersionFile = File(localifyAssetRoot, "version.txt")
+              val ruVersionText = runCatching { if (ruVersionFile.isFile) ruVersionFile.readText().trim() else "missing" }.getOrDefault("unreadable")
+              Log.i(TAG, "Localify asset check: root=${localifyAssetRoot.absolutePath}, localization=${ruLocalizationFile.isFile} (${ruLocalizationFile.length()} bytes), generic=${ruGenericFile.isFile} (${ruGenericFile.length()} bytes), version=$ruVersionText")
+              val il2cppLibrary = File(app.applicationInfo.nativeLibraryDir, "libil2cpp.so")
+              Log.i(TAG, "Localify hook stage: il2cpp=${il2cppLibrary.isFile}, path=${il2cppLibrary.absolutePath}")'''
+          asset_init_count = hook_text.count(asset_init_marker)
+          if asset_init_count != 1:
+              raise SystemExit(f"Expected one FilesChecker.initDir call to instrument, found {asset_init_count}")
+          hook_text = hook_text.replace(asset_init_marker, asset_diagnostic, 1)
+
+          hook_path.write_text(hook_text, encoding="utf-8")
+          print(f"Patched {hook_path}: standalone launch loads a complete embedded config; asset-copy diagnostics added; manager extras remain supported")
+
           # Also replace the fallback URL used when the saved URL is empty.
           values_dir = root / "app/src/main/res"
           string_resources = list(values_dir.glob("values*/strings.xml"))
@@ -390,6 +466,7 @@ jobs:
           print(f"  bundled files: {sum(1 for p in (target_assets / 'local-files').rglob('*') if p.is_file())}")
           print("  checkBuiltInAssets=false, useRemoteAssets=false, useAPIAssets=true, RU API URL set")
           print("  lazyInit=false, useMasterTrans=true, replaceTexture=false, useAPITextureAssets=false")
+          print("  integrated-mode config loads bundled serialized defaults; no mandatory TranslucentActivity launch")
           PYCONFIG
 
           chmod +x gradlew
@@ -427,8 +504,12 @@ jobs:
           apk_path, expected_url = sys.argv[1], sys.argv[2]
           with zipfile.ZipFile(apk_path) as apk:
               dex_names = [n for n in apk.namelist() if n.endswith('.dex')]
-              if not any(expected_url.encode('utf-8') in apk.read(n) for n in dex_names):
+              dex_contents = [apk.read(n) for n in dex_names]
+              if not any(expected_url.encode('utf-8') in data for data in dex_contents):
                   raise SystemExit('::error::Russian releases/latest URL is missing from compiled DEX files')
+              embedded_marker = b'Integrated mode: loaded bundled Localify configuration'
+              if not any(embedded_marker in data for data in dex_contents):
+                  raise SystemExit('::error::Compiled APK does not contain the integrated-mode config fallback')
               config_path = 'assets/gakumas-local/localizationConfig.json'
               if config_path in apk.namelist():
                   config = json.loads(apk.read(config_path).decode('utf-8'))
@@ -509,10 +590,10 @@ jobs:
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
 
             #### Установка:
-            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; для начального запуска не нужны Shizuku, ручной патчинг или отдельная установка менеджера.
-            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API. URL русского API уже установлен по умолчанию.
+            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; автономный запуск загружает конфигурацию Localify из самого модуля и не требует установленного менеджера.
+            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для API-обновлений перевода и настройки Localify. Запуск игры через менеджер по-прежнему передаёт настройки через intent extras.
 
-            Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен, Resource Update From API включён и указывает на Gakumas-Translation-Data-RU.
+            Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен. Русские ресурсы копируются из assets в файловый каталог игры при старте.
           files: |
             Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk
             Gakumas-Localify-RU.apk
