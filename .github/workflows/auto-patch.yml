@@ -209,7 +209,7 @@ jobs:
             --key-pass "pass:${{ secrets.KEY_PASS }}" \
             Gakumas-Localify-RU.apk
 
-      - name: Patch Game APK with LSPatch (Integrated Mode)
+      - name: Patch Game APK with LSPatch & Fix Missing Native Libs
         if: steps.compare.outputs.should_build == 'true'
         run: |
           mkdir -p patched_out
@@ -218,7 +218,45 @@ jobs:
             -k release.jks "${{ secrets.KS_PASS }}" "${{ secrets.KEY_ALIAS }}" "${{ secrets.KEY_PASS }}" \
             -o patched_out/
 
-          mv patched_out/*-lspatched.apk "Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
+          # Находим сгенерированный LSPatch APK
+          LSPATCHED_APK=$(find patched_out -name "*-lspatched.apk" | head -n 1)
+          
+          # Распаковываем его для проверки и внедрения нативных либ
+          mkdir -p fix_apk
+          unzip -q "$LSPATCHED_APK" -d fix_apk
+          
+          # Если LSPatch по какой-то причине стер папку lib/arm64-v8a, возвращаем её из сплитов
+          if [ ! -d "fix_apk/lib/arm64-v8a" ]; then
+            echo "ВНИМАНИЕ: Папка lib отсутствует в пропатченном APK! Внедряем библиотеки из сплитов Google Play..."
+            mkdir -p extracted_libs
+            for apk in gplay_splits/*config*.apk gplay_splits/*arm64*.apk gplay_splits/*.apk; do
+              if [ -f "$apk" ]; then
+                unzip -q "$apk" "lib/*" -d extracted_libs 2>/dev/null || true
+              fi
+            done
+            if [ -d "extracted_libs/lib" ]; then
+              cp -r extracted_libs/lib fix_apk/
+              echo "Нативные библиотеки успешно добавлены внутрь APK!"
+            fi
+          fi
+          
+          # Перепаковываем обратно в чистый APK
+          cd fix_apk
+          zip -q -r ../final_unaligned.apk .
+          cd ..
+          
+          # Выравниваем и подписываем итоговый APK заново
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
+          "$BUILD_TOOLS/zipalign" -p -f 4 final_unaligned.apk final_aligned.apk
+          
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks release.jks \
+            --ks-pass "pass:${{ secrets.KS_PASS }}" \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --key-pass "pass:${{ secrets.KEY_PASS }}" \
+            --out "Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk" \
+            final_aligned.apk
+            
           ls -lh "Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
 
       - name: Publish GitHub Release
