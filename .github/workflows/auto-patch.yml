@@ -106,7 +106,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg4"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -222,68 +222,237 @@ jobs:
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > release.jks
 
-      - name: Build Localify RU APK from Source & Inject Translation
+      - name: Build Localify RU APK, configure API defaults, and bundle Russian assets
         if: steps.compare.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TRANS_URL: ${{ steps.check_upstreams.outputs.trans_url }}
+          TRANS_TAG: ${{ steps.check_upstreams.outputs.trans_tag }}
+          RU_API_URL: https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest
+        shell: bash
         run: |
-          git clone https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
+          set -euo pipefail
+
+          git clone --depth 1 https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
           cd localify-source
 
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" "${{ steps.check_upstreams.outputs.trans_url }}" -o ../ru_trans.zip
+          # Download the published translation archive. It is expected to contain
+          # local-files/ and version.txt, matching the format consumed by Localify.
+          curl -fSL --retry 3 --retry-delay 2 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "$TRANS_URL" -o ../ru_trans.zip
+          unzip -tq ../ru_trans.zip
+          rm -rf ../work_ru
           mkdir -p ../work_ru
-          unzip -q ../ru_trans.zip -d ../work_ru || true
+          unzip -q ../ru_trans.zip -d ../work_ru
 
-          RU_ROOT="../work_ru"
-          if [ ! -d "$RU_ROOT/local-files" ] && [ -z "$(find "$RU_ROOT" -maxdepth 1 -name '*.json')" ]; then
-            SUBDIR=$(find ../work_ru -mindepth 1 -maxdepth 1 -type d | head -n 1)
-            if [ -n "$SUBDIR" ]; then RU_ROOT="$SUBDIR"; fi
+          # Locate the actual payload by its required marker instead of guessing
+          # the ZIP root directory. This prevents copying a nested/empty folder.
+          RU_LOCALIZATION_FILE="$(find ../work_ru -type f -path '*/local-files/localization.json' -print -quit)"
+          if [[ -z "$RU_LOCALIZATION_FILE" || ! -s "$RU_LOCALIZATION_FILE" ]]; then
+            echo "::error::Russian release archive has no non-empty local-files/localization.json"
+            find ../work_ru -maxdepth 4 -type f -print | head -n 100 || true
+            exit 1
           fi
+          RU_ROOT="${RU_LOCALIZATION_FILE%/local-files/localization.json}"
+          RU_FILES="$RU_ROOT/local-files"
+          [[ -s "$RU_FILES/generic.json" || -d "$RU_FILES/genericTrans" ]] || {
+            echo "::error::Russian translation archive lacks generic.json and genericTrans/"
+            exit 1
+          }
 
           TARGET_ASSET_DIR="app/src/main/assets/gakumas-local"
+          mkdir -p "$TARGET_ASSET_DIR"
+
+          # Fully replace the old bundled language pack. Do not merge into the
+          # source pack: stale Chinese/English files can otherwise override RU.
+          rm -rf "$TARGET_ASSET_DIR/local-files"
           mkdir -p "$TARGET_ASSET_DIR/local-files"
+          cp -a "$RU_FILES/." "$TARGET_ASSET_DIR/local-files/"
 
-          mkdir -p ../saved_fonts
-          find "$TARGET_ASSET_DIR" -type f \( -name "*.ttf" -o -name "*.otf" \) -exec cp {} ../saved_fonts/ \; 2>/dev/null || true
-
-          rm -rf "$TARGET_ASSET_DIR/local-files/"*
-
-          if [ -d "$RU_ROOT/local-files" ]; then
-            cp -r "$RU_ROOT/local-files/"* "$TARGET_ASSET_DIR/local-files/"
+          # Preserve the translation package's own version, not the combined
+          # game/plugin/release tag. Localify uses this marker for resource sync.
+          if [[ -s "$RU_ROOT/version.txt" ]]; then
+            cp "$RU_ROOT/version.txt" "$TARGET_ASSET_DIR/version.txt"
           else
-            cp -r "$RU_ROOT/"* "$TARGET_ASSET_DIR/local-files/" 2>/dev/null || true
+            printf '%s\n' "$TRANS_TAG" > "$TARGET_ASSET_DIR/version.txt"
           fi
 
-          for font in ../saved_fonts/*; do
-            [ -e "$font" ] || continue
-            fname=$(basename "$font")
-            if [ -z "$(find "$TARGET_ASSET_DIR" -name "$fname")" ]; then
-              cp "$font" "$TARGET_ASSET_DIR/local-files/"
-            fi
-          done
+          # The RU pack provides an Android font. Warn if that expected asset is
+          # absent, but do not fail if the upstream project renames it later.
+          if [[ ! -s "$TARGET_ASSET_DIR/local-files/gkanz0-ontMIX.otf" ]]; then
+            echo "::warning::RU Android font gkanz0-ontMIX.otf was not found in the latest pack. Checking available fonts:"
+            find "$TARGET_ASSET_DIR/local-files" -maxdepth 2 -type f \( -iname '*.otf' -o -iname '*.ttf' \) -print || true
+          fi
 
-          echo "${{ steps.compare.outputs.combined_tag }}" > "$TARGET_ASSET_DIR/version.txt"
+          # Make initial game configuration compatible with the RU pack.
+          # Upstream translation instructions require lazyInit/Fast Initialization
+          # off and MasterDB localization on. Texture replacement is explicitly off.
+          python3 - <<'PYCONFIG'
+          import json
+          import re
+          from pathlib import Path
+
+          ru_api = "https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest"
+          root = Path.cwd()
+          target_assets = root / "app/src/main/assets/gakumas-local"
+
+          def set_bool_property(path: Path, key: str, value: bool, required: bool = True):
+              text = path.read_text(encoding="utf-8")
+              pattern = re.compile(rf"(\bvar\s+{re.escape(key)}\s*:\s*Boolean\s*=\s*)(true|false)\b")
+              updated, count = pattern.subn(lambda m: m.group(1) + ("true" if value else "false"), text)
+              if required and count != 1:
+                  raise SystemExit(f"Expected exactly one Boolean default for {key} in {path}, found {count}")
+              if count:
+                  path.write_text(updated, encoding="utf-8")
+                  print(f"Set {path}: {key}={str(value).lower()}")
+
+          # These are the per-game hook settings used by the embedded module.
+          gakumas_models = list((root / "app/src/main/java").rglob("GakumasConfig.kt"))
+          if len(gakumas_models) != 1:
+              raise SystemExit(f"Expected one GakumasConfig.kt, found {len(gakumas_models)}")
+          gakumas_model = gakumas_models[0]
+          set_bool_property(gakumas_model, "lazyInit", False)
+          set_bool_property(gakumas_model, "replaceTexture", False)
+          set_bool_property(gakumas_model, "useMasterTrans", True)
+          set_bool_property(gakumas_model, "enabled", True, required=False)
+
+          # ProgramConfig drives the Resource Settings screen and API updater.
+          # Enable API updates by default and make the RU release API the initial URL.
+          program_models = list((root / "app/src/main/java").rglob("ProgramConfig.kt"))
+          if len(program_models) != 1:
+              raise SystemExit(f"Expected one ProgramConfig.kt, found {len(program_models)}")
+          program_model = program_models[0]
+          set_bool_property(program_model, "checkBuiltInAssets", False)
+          set_bool_property(program_model, "useRemoteAssets", False)
+          set_bool_property(program_model, "useAPIAssets", True)
+          set_bool_property(program_model, "useAPITextureAssets", False)
+          program_text = program_model.read_text(encoding="utf-8")
+          url_pattern = re.compile(r'(\bvar\s+useAPIAssetsURL\s*:\s*String\s*=\s*)"(?:[^"\\]|\\.)*"')
+          program_text, url_count = url_pattern.subn(lambda m: m.group(1) + json.dumps(ru_api), program_text)
+          if url_count != 1:
+              raise SystemExit(f"Expected exactly one useAPIAssetsURL default in {program_model}, found {url_count}")
+          program_model.write_text(program_text, encoding="utf-8")
+          print(f"Set {program_model}: useAPIAssetsURL={ru_api}")
+
+          # Also replace the fallback URL used when the saved URL is empty.
+          values_dir = root / "app/src/main/res"
+          string_resources = list(values_dir.glob("values*/strings.xml"))
+          string_re = re.compile(r'(<string\s+name="default_assets_check_api"[^>]*>)(.*?)(</string>)', re.DOTALL)
+          total_replacements = 0
+          for path in string_resources:
+              text = path.read_text(encoding="utf-8")
+              updated, count = string_re.subn(lambda m: m.group(1) + ru_api + m.group(3), text)
+              if count:
+                  path.write_text(updated, encoding="utf-8")
+                  total_replacements += count
+                  print(f"Updated RU API fallback in {path}")
+          if total_replacements == 0:
+              raise SystemExit("No default_assets_check_api string resource was found to patch")
+
+          # Some revisions ship an asset-side localizationConfig.json; patch it
+          # when present while preserving every unrelated option in that file.
+          config_candidates = list((root / "app/src/main/assets").rglob("localizationConfig.json"))
+          for path in config_candidates:
+              try:
+                  config = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  raise SystemExit(f"Invalid JSON in {path}: {exc}")
+              config["enabled"] = True
+              config["lazyInit"] = False
+              config["replaceTexture"] = False
+              config["useMasterTrans"] = True
+              path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+              print(f"Updated game config asset: {path}")
+
+          # Validate source defaults and bundled data before Gradle packages them.
+          current = program_model.read_text(encoding="utf-8")
+          if "useAPIAssets: Boolean = true" not in current or ru_api not in current:
+              raise SystemExit("ProgramConfig API defaults did not survive source patch")
+          cfg = gakumas_model.read_text(encoding="utf-8")
+          if not re.search(r"var\s+lazyInit\s*:\s*Boolean\s*=\s*false", cfg):
+              raise SystemExit("Fast Initialization/lazyInit is not disabled by default")
+          if not re.search(r"var\s+replaceTexture\s*:\s*Boolean\s*=\s*false", cfg):
+              raise SystemExit("Replace Texture is not disabled by default")
+          if not re.search(r"var\s+useMasterTrans\s*:\s*Boolean\s*=\s*true", cfg):
+              raise SystemExit("MasterDB localization is not enabled by default")
+          for required in ("localization.json",):
+              p = target_assets / "local-files" / required
+              if not p.is_file() or p.stat().st_size == 0:
+                  raise SystemExit(f"Missing/empty bundled Russian file: {p}")
+          if not (target_assets / "local-files" / "generic.json").is_file() and not (target_assets / "local-files" / "genericTrans").is_dir():
+              raise SystemExit("No generic translation data was bundled")
+          version = target_assets / "version.txt"
+          if not version.is_file() or not version.read_text(encoding="utf-8").strip():
+              raise SystemExit("Bundled version.txt is missing/empty")
+          print("Verified RU assets and Localify defaults:")
+          print(f"  translation version: {version.read_text(encoding='utf-8').strip()}")
+          print(f"  bundled files: {sum(1 for p in (target_assets / 'local-files').rglob('*') if p.is_file())}")
+          print("  checkBuiltInAssets=false, useRemoteAssets=false, useAPIAssets=true, RU API URL set")
+          print("  lazyInit=false, useMasterTrans=true, replaceTexture=false, useAPITextureAssets=false")
+          PYCONFIG
 
           chmod +x gradlew
           ./gradlew assembleRelease
 
-          # Надежный поиск скомпилированного APK плагина
-          BUILT_APK=$(find . -name "*release*.apk" | head -n 1)
-          if [ -z "$BUILT_APK" ]; then
-            BUILT_APK=$(find . -name "*.apk" | head -n 1)
+          BUILT_APK="$(find app/build/outputs/apk -type f -name '*release*.apk' -print -quit)"
+          if [[ -z "$BUILT_APK" || ! -s "$BUILT_APK" ]]; then
+            BUILT_APK="$(find . -type f -name '*release*.apk' -not -path './.gradle/*' -print -quit)"
           fi
-          echo "Найден собранный APK плагина: $BUILT_APK"
+          if [[ -z "$BUILT_APK" || ! -s "$BUILT_APK" ]]; then
+            echo "::error::Could not find the compiled Localify release APK"
+            find . -type f -name '*.apk' -print || true
+            exit 1
+          fi
+          echo "Built Localify APK: $BUILT_APK"
+
+          # Assert the final manager/module APK really contains Russian resources
+          # and the settings defaults that will be embedded into the game APK.
+          unzip -Z1 "$BUILT_APK" | grep -Fxq 'assets/gakumas-local/local-files/localization.json' || {
+            echo "::error::Built Localify APK has no bundled localization.json"
+            exit 1
+          }
+          unzip -Z1 "$BUILT_APK" | grep -Fxq 'assets/gakumas-local/version.txt' || {
+            echo "::error::Built Localify APK has no bundled translation version.txt"
+            exit 1
+          }
+          unzip -p "$BUILT_APK" assets/gakumas-local/version.txt | grep -q . || {
+            echo "::error::Bundled translation version.txt is empty"
+            exit 1
+          }
+          # Confirm the RU API URL made it into the compiled Kotlin bytecode and
+          # any packaged localizationConfig.json still has the intended switches.
+          python3 - "$BUILT_APK" "$RU_API_URL" <<'PYAPKVERIFY'
+          import sys, zipfile, json
+          apk_path, expected_url = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(apk_path) as apk:
+              dex_names = [n for n in apk.namelist() if n.endswith('.dex')]
+              if not any(expected_url.encode('utf-8') in apk.read(n) for n in dex_names):
+                  raise SystemExit('::error::Russian releases/latest URL is missing from compiled DEX files')
+              config_path = 'assets/gakumas-local/localizationConfig.json'
+              if config_path in apk.namelist():
+                  config = json.loads(apk.read(config_path).decode('utf-8'))
+                  required = {'enabled': True, 'lazyInit': False, 'replaceTexture': False, 'useMasterTrans': True}
+                  wrong = {k: (config.get(k), v) for k, v in required.items() if config.get(k) != v}
+                  if wrong:
+                      raise SystemExit(f'::error::Packaged localizationConfig.json has incorrect settings: {wrong}')
+              print(f'Verified compiled RU API URL and packaged Localify settings in {apk_path}')
+          PYAPKVERIFY
           cp "$BUILT_APK" ../Gakumas-Localify-RU-unsigned.apk
           cd ..
 
-          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
-          "$BUILD_TOOLS/zipalign" -p -f 4 Gakumas-Localify-RU-unsigned.apk Gakumas-Localify-RU.apk
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          "$BUILD_TOOLS/zipalign" -p -f 4 Gakumas-Localify-RU-unsigned.apk Gakumas-Localify-RU-aligned.apk
           "$BUILD_TOOLS/apksigner" sign \
             --ks release.jks \
             --ks-pass "pass:${{ secrets.KS_PASS }}" \
             --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
             --key-pass "pass:${{ secrets.KEY_PASS }}" \
-            Gakumas-Localify-RU.apk
+            --out Gakumas-Localify-RU.apk \
+            Gakumas-Localify-RU-aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose Gakumas-Localify-RU.apk
+          "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 Gakumas-Localify-RU.apk
+          ls -lh Gakumas-Localify-RU.apk
 
       - name: Patch Game APK with LSPatch (publish its output unchanged)
         if: steps.compare.outputs.should_build == 'true'
@@ -340,8 +509,10 @@ jobs:
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
 
             #### Установка:
-            1. Скачайте и установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`** (Shizuku и ручной патчинг **не требуются**, перевод и шрифт уже вшиты внутрь).
-            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`**, если хотите менять настройки графики, 60 FPS, ориентацию экрана или подгружать обновления перевода без переустановки игры.
+            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; для начального запуска не нужны Shizuku, ручной патчинг или отдельная установка менеджера.
+            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API. URL русского API уже установлен по умолчанию.
+
+            Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен, Resource Update From API включён и указывает на Gakumas-Translation-Data-RU.
           files: |
             Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk
             Gakumas-Localify-RU.apk
@@ -362,9 +533,11 @@ jobs:
           if [ "$LAST_TAG" = "none" ]; then
             CHANGES="🎉 **Первый автоматический релиз готового APK!**"
           else
-            OLD_GAME=$(echo "$LAST_TAG" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\1/p')
-            OLD_PLUGIN=$(echo "$LAST_TAG" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\2/p')
-            OLD_TRANS=$(echo "$LAST_TAG" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\3/p')
+            # Remove the workflow/config revision suffix before comparing component versions.
+            LAST_TAG_CORE=$(echo "$LAST_TAG" | sed -E 's/_cfg[0-9]+$//')
+            OLD_GAME=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\1/p')
+            OLD_PLUGIN=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\2/p')
+            OLD_TRANS=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\3/p')
 
             if [ "$OLD_GAME" != "$CUR_GAME" ]; then
               CHANGES="${CHANGES}🎮 **Обновилась игра в Google Play:** \`${OLD_GAME:-?}\` ➔ \`${CUR_GAME}\`\n"
