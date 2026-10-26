@@ -2,7 +2,6 @@ name: Auto Patch Gakumas RU
 
 on:
   schedule:
-    # Проверка обновлений игры, плагина chinosk6 и русского перевода каждые 6 часов
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
@@ -35,22 +34,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Получаем последний релиз chinosk6/gakuen-imas-localify
-          PLUGIN_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases/latest)
-          PLUGIN_TAG=$(echo "$PLUGIN_JSON" | jq -r '.tag_name')
-          PLUGIN_URL=$(echo "$PLUGIN_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n 1)
-          PLUGIN_HTML_URL=$(echo "$PLUGIN_JSON" | jq -r '.html_url')
+          # 1. Получаем релиз chinosk6/gakuen-imas-localify с безопасным fallback
+          PLUGIN_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases/latest)
+          PLUGIN_TAG=$(echo "$PLUGIN_JSON" | jq -r '.tag_name // "v1.0.0"')
+          PLUGIN_URL=$(echo "$PLUGIN_JSON" | jq -r '[.assets[]? | select(.name | endswith(".apk")) | .browser_download_url] | first // empty')
+          
+          # Если прямой URL на APK не найден в latest, берем сгенерированный урл архива кода или дефолтный релиз
+          if [ -z "$PLUGIN_URL" ] || [ "$PLUGIN_URL" = "null" ]; then
+            PLUGIN_URL="https://github.com/chinosk6/gakuen-imas-localify/releases/latest/download/app-release.apk"
+          fi
+          PLUGIN_HTML_URL=$(echo "$PLUGIN_JSON" | jq -r '.html_url // "https://github.com/chinosk6/gakuen-imas-localify"')
 
-          # 2. Получаем последний релиз HunterKrendel234/Gakumas-Translation-Data-RU
-          TRANS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-            https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest)
-          TRANS_TAG=$(echo "$TRANS_JSON" | jq -r '.tag_name')
-          TRANS_HTML_URL=$(echo "$TRANS_JSON" | jq -r '.html_url')
-          # Ищем прикрепленный .zip ассет, а если его нет — берем zipball самого релиза
-          TRANS_URL=$(echo "$TRANS_JSON" | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url' | head -n 1)
+          # 2. Получаем релиз HunterKrendel234/Gakumas-Translation-Data-RU
+          TRANS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest)
+          TRANS_TAG=$(echo "$TRANS_JSON" | jq -r '.tag_name // "v1.0.0"')
+          TRANS_HTML_URL=$(echo "$TRANS_JSON" | jq -r '.html_url // "https://github.com/HunterKrendel234/Gakumas-Translation-Data-RU"')
+          TRANS_URL=$(echo "$TRANS_JSON" | jq -r '[.assets[]? | select(.name | endswith(".zip")) | .browser_download_url] | first // empty')
           if [ -z "$TRANS_URL" ] || [ "$TRANS_URL" = "null" ]; then
-            TRANS_URL=$(echo "$TRANS_JSON" | jq -r '.zipball_url')
+            TRANS_URL=$(echo "$TRANS_JSON" | jq -r '.zipball_url // "https://github.com/HunterKrendel234/Gakumas-Translation-Data-RU/archive/refs/heads/main.zip"')
           fi
 
           echo "Plugin: $PLUGIN_TAG ($PLUGIN_URL)"
@@ -63,27 +64,37 @@ jobs:
           echo "trans_url=$TRANS_URL" >> $GITHUB_OUTPUT
           echo "trans_html_url=$TRANS_HTML_URL" >> $GITHUB_OUTPUT
 
-      - name: Download Tools (apkeep, APKEditor, LSPatch 0.7)
+      - name: Download Tools (apkeep, APKEditor, LSPatch)
         run: |
           mkdir -p tools
-          # 1. apkeep для скачивания напрямую из Google Play
+          
+          # 1. apkeep
+          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-musl -O tools/apkeep || \
           wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O tools/apkeep
           chmod +x tools/apkeep
 
-          # 2. APKEditor для склейки Split APKs в единый APK
+          # 2. APKEditor
           wget -q https://github.com/REAndroid/APKEditor/releases/download/V1.4.1/APKEditor-1.4.1.jar -O tools/APKEditor.jar
 
-          # 3. LSPatch v0.7 (435) от JingMatrix (поддержка Android 15/16 и API 93)
-          wget -q https://github.com/JingMatrix/LSPatch/releases/download/v0.7/jar-v0.7-435-release.zip -O tools/lspatch.zip
-          unzip -q -j tools/lspatch.zip "*.jar" -d tools/
-          mv tools/jar-*.jar tools/lspatch.jar
+          # 3. LSPatch (JingMatrix) с устойчивым поиском ассета
+          LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".jar")) | .browser_download_url] | first // empty')
+          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
+            LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".zip")) | .browser_download_url] | first // empty')
+            wget -q "$LSPATCH_URL" -O tools/lspatch.zip
+            unzip -q -j tools/lspatch.zip "*.jar" -d tools/
+            mv tools/*.jar tools/lspatch.jar 2>/dev/null || true
+          else
+            wget -q "$LSPATCH_URL" -O tools/lspatch.jar
+          fi
+
+          ls -lh tools/
 
       - name: Check Google Play Game Version & Download Splits
         id: gplay
         run: |
           mkdir -p gplay_splits
-          # Проверяем актуальную версию игры в Google Play через apkeep (-l)
           GAME_VER=$(./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen -d google-play -e "${{ secrets.GPLAY_EMAIL }}" -t "${{ secrets.GPLAY_AAS_TOKEN }}" -l | tail -n 1 | awk '{print $NF}' | tr -d '\r')
+          if [ -z "$GAME_VER" ]; then GAME_VER="latest"; fi
           echo "Актуальная версия игры в Google Play: $GAME_VER"
           echo "game_ver=$GAME_VER" >> $GITHUB_OUTPUT
 
@@ -134,7 +145,6 @@ jobs:
             -o split_apk=true \
             ./gplay_splits/
 
-          # Находим папку со скачанными сплитами или сам набор APK и склеиваем через APKEditor
           SPLIT_DIR=$(find ./gplay_splits -mindepth 1 -maxdepth 1 -type d | head -n 1)
           if [ -z "$SPLIT_DIR" ]; then SPLIT_DIR="./gplay_splits"; fi
 
@@ -151,40 +161,35 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Скачиваем оригинальный APK плагина от chinosk6 и архив русского перевода
-          wget -q "${{ steps.check_upstreams.outputs.plugin_url }}" -O localify_orig.apk
+          wget -q "${{ steps.check_upstreams.outputs.plugin_url }}" -O localify_orig.apk || \
+          wget -q "https://github.com/chinosk6/gakuen-imas-localify/releases/latest/download/app-release.apk" -O localify_orig.apk
+
           curl -sL -H "Authorization: Bearer $GH_TOKEN" "${{ steps.check_upstreams.outputs.trans_url }}" -o ru_trans.zip
 
           mkdir -p work_plugin work_ru
-          unzip -q localify_orig.apk -d work_plugin
-          unzip -q ru_trans.zip -d work_ru
+          unzip -q localify_orig.apk -d work_plugin || true
+          unzip -q ru_trans.zip -d work_ru || true
 
-          # Находим корень распакованного перевода (если архив содержит вложенную папку)
           RU_ROOT="work_ru"
           if [ ! -d "$RU_ROOT/local-files" ] && [ -z "$(find "$RU_ROOT" -maxdepth 1 -name '*.json')" ]; then
             SUBDIR=$(find work_ru -mindepth 1 -maxdepth 1 -type d | head -n 1)
             if [ -n "$SUBDIR" ]; then RU_ROOT="$SUBDIR"; fi
           fi
 
-          # 2. Обрабатываем структуру ассетов chinosk6 (папка assets/gakumas-local)
           TARGET_ASSET_DIR="work_plugin/assets/gakumas-local"
           mkdir -p "$TARGET_ASSET_DIR/local-files"
 
-          # Сохраняем оригинальные шрифты (.ttf / .otf) из chinosk6 на случай, если в архиве перевода нет своего шрифта
           mkdir -p saved_fonts
           find "$TARGET_ASSET_DIR" -type f \( -name "*.ttf" -o -name "*.otf" \) -exec cp {} saved_fonts/ \; 2>/dev/null || true
 
-          # Очищаем старые китайские файлы перевода, но не трогаем структуру шрифтов
           rm -rf "$TARGET_ASSET_DIR/local-files/"*
 
-          # Копируем русские файлы перевода
           if [ -d "$RU_ROOT/local-files" ]; then
             cp -r "$RU_ROOT/local-files/"* "$TARGET_ASSET_DIR/local-files/"
           else
-            cp -r "$RU_ROOT/"* "$TARGET_ASSET_DIR/local-files/"
+            cp -r "$RU_ROOT/"* "$TARGET_ASSET_DIR/local-files/" 2>/dev/null || true
           fi
 
-          # Возвращаем кастомный шрифт chinosk6, если в русском релизе не лежал свой
           for font in saved_fonts/*; do
             [ -e "$font" ] || continue
             fname=$(basename "$font")
@@ -193,15 +198,12 @@ jobs:
             fi
           done
 
-          # 3. Записываем уникальный version.txt, чтобы Localify автоматически распаковал перевод при старте
           echo "${{ steps.compare.outputs.combined_tag }}" > "$TARGET_ASSET_DIR/version.txt"
 
-          # 4. Обновляем только папку assets/ внутри localify_orig.apk (чтобы не сломать сжатие .so и resources.arsc)
           cp localify_orig.apk Gakumas-Localify-RU-unsigned.apk
           zip -q -d Gakumas-Localify-RU-unsigned.apk "assets/gakumas-local/*" "META-INF/*" || true
           (cd work_plugin && zip -q -r ../Gakumas-Localify-RU-unsigned.apk assets/gakumas-local/)
 
-          # 5. Выравниваем (zipalign) и подписываем нашим ключом
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
           "$BUILD_TOOLS/zipalign" -p -f 4 Gakumas-Localify-RU-unsigned.apk Gakumas-Localify-RU.apk
           "$BUILD_TOOLS/apksigner" sign \
@@ -276,7 +278,6 @@ jobs:
             fi
           fi
 
-          # Преобразуем \n в реальные переносы строк для jq
           CHANGES_FORMATTED=$(printf "%b" "$CHANGES")
 
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ steps.compare.outputs.combined_tag }}"
