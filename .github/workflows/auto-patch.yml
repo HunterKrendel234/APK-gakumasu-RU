@@ -106,7 +106,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg4"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg5"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -316,6 +316,7 @@ jobs:
           set_bool_property(gakumas_model, "replaceTexture", False)
           set_bool_property(gakumas_model, "useMasterTrans", True)
           set_bool_property(gakumas_model, "enabled", True, required=False)
+          set_bool_property(gakumas_model, "forceExportResource", False, required=False)
 
           # ProgramConfig drives the Resource Settings screen and API updater.
           # Enable API updates by default and make the RU release API the initial URL.
@@ -334,6 +335,49 @@ jobs:
               raise SystemExit(f"Expected exactly one useAPIAssetsURL default in {program_model}, found {url_count}")
           program_model.write_text(program_text, encoding="utf-8")
           print(f"Set {program_model}: useAPIAssetsURL={ru_api}")
+
+          # LSPatch embeds the module APK, but it does not install the Localify app
+          # itself. Upstream GakumasHookMain requests config by launching
+          # io.github.chinosk.gakumas.localify.TranslucentActivity. When that launch
+          # fails, upstream falls back through a detached Activity(); with our
+          # useAPIAssets=true default that path can dereference fakeActivity.filesDir
+          # and abort before initHook() is reached. Use the real game Application
+          # Context for the bundled-RU fallback, and keep the manager's normal
+          # API-config path untouched when it successfully supplies gkmsData.
+          hook_models = list((root / "app/src/main/java").rglob("GakumasHookMain.kt"))
+          if len(hook_models) != 1:
+              raise SystemExit(f"Expected one GakumasHookMain.kt, found {len(hook_models)}")
+          hook_main = hook_models[0]
+          hook_text = hook_main.read_text(encoding="utf-8")
+          fallback_pattern = re.compile(
+              r'catch\s*\(e:\s*Exception\)\s*\{\s*'
+              r'getConfigError\s*=\s*e\s*'
+              r'val\s+fakeActivity\s*=\s*Activity\(\)\.apply\s*\{\s*'
+              r'intent\s*=\s*Intent\(\)\.apply\s*\{\s*'
+              r'putExtra\("gkmsData",\s*"\{\}"\)\s*\}\s*\}\s*'
+              r'initGkmsConfig\(fakeActivity\)\s*\}',
+              re.DOTALL,
+          )
+          fallback_replacement = '''catch (e: Exception) {
+                      getConfigError = e
+                      Log.e(TAG, "Unable to request Localify settings; using bundled translation fallback", e)
+                      gkmsDataInited = true
+                      FilesChecker.initAndCheck(activity.filesDir, modulePath)
+                      loadConfig("{}")
+                  }'''
+          hook_text, fallback_count = fallback_pattern.subn(lambda _: fallback_replacement, hook_text)
+          if fallback_count != 1:
+              raise SystemExit(
+                  "Could not safely patch GakumasHookMain config fallback: "
+                  f"expected one detached-Activity fallback, found {fallback_count}. "
+                  "Upstream code may have changed; inspect GakumasHookMain.kt before building."
+              )
+          hook_main.write_text(hook_text, encoding="utf-8")
+          if "FilesChecker.initAndCheck(activity.filesDir, modulePath)" not in hook_text:
+              raise SystemExit("Bundled fallback no longer initializes FilesChecker with a real Context")
+          if "initGkmsConfig(fakeActivity)" in hook_text:
+              raise SystemExit("Unsafe fake Activity config fallback remains in GakumasHookMain.kt")
+          print("Patched GakumasHookMain: safe real-Context fallback for embedded RU assets")
 
           # Also replace the fallback URL used when the saved URL is empty.
           values_dir = root / "app/src/main/res"
@@ -376,6 +420,11 @@ jobs:
               raise SystemExit("Replace Texture is not disabled by default")
           if not re.search(r"var\s+useMasterTrans\s*:\s*Boolean\s*=\s*true", cfg):
               raise SystemExit("MasterDB localization is not enabled by default")
+          hook_cfg = hook_main.read_text(encoding="utf-8")
+          if "FilesChecker.initAndCheck(activity.filesDir, modulePath)" not in hook_cfg or "loadConfig(\"{}\")" not in hook_cfg:
+              raise SystemExit("Safe Localify integration-mode fallback did not survive source patch")
+          if "initGkmsConfig(fakeActivity)" in hook_cfg:
+              raise SystemExit("Unsafe fake Activity fallback survived source patch")
           for required in ("localization.json",):
               p = target_assets / "local-files" / required
               if not p.is_file() or p.stat().st_size == 0:
@@ -509,8 +558,9 @@ jobs:
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
 
             #### Установка:
-            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; для начального запуска не нужны Shizuku, ручной патчинг или отдельная установка менеджера.
-            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API. URL русского API уже установлен по умолчанию.
+            1. Установите **оба APK**: `Gakumas-Localify-RU.apk` и `Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`.
+            2. Откройте Localify и запускайте игру кнопкой запуска внутри приложения. Это передаёт игре сохранённые параметры Localify и позволяет применить обновлённый пакет из RU API. Если Android блокирует запуск другого приложения, разрешите Localify запуск игры/открытие других приложений.
+            3. Русский пакет также встроен в APK игры и используется как fallback, когда приложение Localify недоступно. В таком режиме динамические параметры и API-обновления Localify переданы не будут.
 
             Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен, Resource Update From API включён и указывает на Gakumas-Translation-Data-RU.
           files: |
