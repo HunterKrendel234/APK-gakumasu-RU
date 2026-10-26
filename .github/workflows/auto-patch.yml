@@ -91,9 +91,89 @@ jobs:
 
       - name: Check Google Play Game Version
         id: gplay
+        shell: bash
         run: |
-          GAME_VER="latest"
-          echo "game_ver=$GAME_VER" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          # Read the public Google Play listing using the same data path as
+          # Kajaqq/gaku-patcher's play_ver_check/app.py. No third-party Python
+          # packages are required. Fail closed if Google changes the page format,
+          # rather than publishing a release with a fake "latest" or "unknown" version.
+          python3 - <<'PYVERSION'
+          import json
+          import os
+          import re
+          import time
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+
+          app_id = "com.bandainamcoent.idolmaster_gakuen"
+          url = f"https://play.google.com/store/apps/details?id={app_id}&hl=en"
+          request = Request(
+              url,
+              headers={
+                  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                  "Accept-Language": "en-US,en;q=0.9",
+              },
+          )
+
+          html = None
+          last_error = None
+          for attempt in range(3):
+              try:
+                  with urlopen(request, timeout=30) as response:
+                      html = response.read().decode("utf-8", errors="replace")
+                  if len(html) < 1000:
+                      raise RuntimeError(f"Google Play response is unexpectedly short ({len(html)} characters)")
+                  break
+              except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
+                  html = None
+                  last_error = exc
+                  if attempt < 2:
+                      time.sleep(3 * (attempt + 1))
+
+          if html is None:
+              raise SystemExit(f"::error::Could not fetch the Google Play listing after 3 attempts: {last_error}")
+
+          # These expressions and the ds:5 JSON path follow the upstream
+          # play_ver_check implementation used by Kajaqq/gaku-patcher.
+          script_re = re.compile(r"AF_initDataCallback[\s\S]*?</script")
+          key_re = re.compile(r"(ds:.*?)'")
+          value_re = re.compile(r"data:([\s\S]*?), sideChannel: {}}\);</")
+          dataset = {}
+          for script in script_re.findall(html):
+              keys = key_re.findall(script)
+              values = value_re.findall(script)
+              if not keys or not values:
+                  continue
+              try:
+                  dataset[keys[0]] = json.loads(values[0])
+              except json.JSONDecodeError:
+                  continue
+
+          node = dataset.get("ds:5")
+          for index in (1, 2, 140, 0, 0, 0):
+              try:
+                  node = node[index]
+              except (TypeError, KeyError, IndexError):
+                  node = None
+                  break
+
+          if node is None:
+              raise SystemExit(
+                  "::error::Could not extract the game version from Google Play. "
+                  "The listing format may have changed; refusing to build with a fake version."
+              )
+
+          game_version = str(node).strip()
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", game_version):
+              raise SystemExit(f"::error::Google Play returned an invalid version string: {game_version!r}")
+
+          print(f"Google Play game version: {game_version}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"game_ver={game_version}\n")
+          PYVERSION
 
       - name: Compare with Latest Published Release
         id: compare
