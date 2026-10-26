@@ -155,49 +155,46 @@ jobs:
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > release.jks
 
-      - name: Inject RU Translation into chinosk6 Localify APK
+      - name: Build Localify RU APK from Source & Inject Translation
         if: steps.compare.outputs.should_build == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Динамически ищем любой .apk файл в последнем релизе chinosk6 через GitHub API
-          PLUGIN_URL=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".apk")) | .browser_download_url] | first // empty')
-          
-          if [ -z "$PLUGIN_URL" ] || [ "$PLUGIN_URL" = "null" ]; then
-            echo "Ошибка: не удалось найти APK в релизах chinosk6, пробуем запасную ссылку..."
-            PLUGIN_URL="https://github.com/chinosk6/gakuen-imas-localify/releases/latest/download/gakuen-imas-localify.apk"
-          fi
-          
-          echo "Скачиваем Localify APK по адресу: $PLUGIN_URL"
-          wget -q "$PLUGIN_URL" -O localify_orig.apk
+          # 1. Клонируем актуальные исходники плагина (зеркало chinosk6)
+          git clone https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
+          cd localify-source
 
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" "${{ steps.check_upstreams.outputs.trans_url }}" -o ru_trans.zip
+          # 2. Скачиваем архив твоего русского перевода
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" "${{ steps.check_upstreams.outputs.trans_url }}" -o ../ru_trans.zip
+          mkdir -p ../work_ru
+          unzip -q ../ru_trans.zip -d ../work_ru || true
 
-          mkdir -p work_plugin work_ru
-          unzip -q localify_orig.apk -d work_plugin || true
-          unzip -q ru_trans.zip -d work_ru || true
-
-          RU_ROOT="work_ru"
+          RU_ROOT="../work_ru"
           if [ ! -d "$RU_ROOT/local-files" ] && [ -z "$(find "$RU_ROOT" -maxdepth 1 -name '*.json')" ]; then
-            SUBDIR=$(find work_ru -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            SUBDIR=$(find ../work_ru -mindepth 1 -maxdepth 1 -type d | head -n 1)
             if [ -n "$SUBDIR" ]; then RU_ROOT="$SUBDIR"; fi
           fi
 
-          TARGET_ASSET_DIR="work_plugin/assets/gakumas-local"
+          # 3. Настраиваем папки ассетов в исходниках Gradle-проекта
+          TARGET_ASSET_DIR="app/src/main/assets/gakumas-local"
           mkdir -p "$TARGET_ASSET_DIR/local-files"
 
-          mkdir -p saved_fonts
-          find "$TARGET_ASSET_DIR" -type f \( -name "*.ttf" -o -name "*.otf" \) -exec cp {} saved_fonts/ \; 2>/dev/null || true
+          # Сохраняем оригинальные шрифты (.ttf / .otf), если они были в исходниках
+          mkdir -p ../saved_fonts
+          find "$TARGET_ASSET_DIR" -type f \( -name "*.ttf" -o -name "*.otf" \) -exec cp {} ../saved_fonts/ \; 2>/dev/null || true
 
+          # Очищаем старые файлы перевода
           rm -rf "$TARGET_ASSET_DIR/local-files/"*
 
+          # Копируем русский перевод
           if [ -d "$RU_ROOT/local-files" ]; then
             cp -r "$RU_ROOT/local-files/"* "$TARGET_ASSET_DIR/local-files/"
           else
             cp -r "$RU_ROOT/"* "$TARGET_ASSET_DIR/local-files/" 2>/dev/null || true
           fi
 
-          for font in saved_fonts/*; do
+          # Возвращаем кастомный шрифт
+          for font in ../saved_fonts/*; do
             [ -e "$font" ] || continue
             fname=$(basename "$font")
             if [ -z "$(find "$TARGET_ASSET_DIR" -name "$fname")" ]; then
@@ -205,11 +202,17 @@ jobs:
             fi
           done
 
+          # Записываем version.txt
           echo "${{ steps.compare.outputs.combined_tag }}" > "$TARGET_ASSET_DIR/version.txt"
 
-          cp localify_orig.apk Gakumas-Localify-RU-unsigned.apk
-          zip -q -d Gakumas-Localify-RU-unsigned.apk "assets/gakumas-local/*" "META-INF/*" || true
-          (cd work_plugin && zip -q -r ../Gakumas-Localify-RU-unsigned.apk assets/gakumas-local/)
+          # 4. Собираем APK плагина через Gradle
+          chmod +x gradlew
+          ./gradlew assembleRelease
+
+          # 5. Находим собранный APK, выравниваем и подписываем нашим ключом
+          BUILT_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          cp "$BUILT_APK" ../Gakumas-Localify-RU-unsigned.apk
+          cd ..
 
           BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -n 1)
           "$BUILD_TOOLS/zipalign" -p -f 4 Gakumas-Localify-RU-unsigned.apk Gakumas-Localify-RU.apk
