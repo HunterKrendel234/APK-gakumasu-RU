@@ -184,7 +184,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg6"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg7"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -205,12 +205,50 @@ jobs:
         uses: actions/cache@v4
         with:
           path: clean_game/gaku_merged.apk
-          # Bump this key when changing the split-download/merge pipeline so an old
-          # merged APK without native libraries cannot be restored from cache.
-          key: gakumas-clean-apk-v3-${{ steps.gplay.outputs.game_ver }}
+          # v4 migrates the known-good pre-version-detection cache. The old fixed
+          # key is only a restore candidate; it is never trusted without validation.
+          key: gakumas-clean-apk-v4-${{ steps.gplay.outputs.game_ver }}
+          restore-keys: |
+            gakumas-clean-apk-v3-latest
+
+      - name: Validate cached merged game APK
+        id: validate-game-cache
+        if: steps.compare.outputs.should_build == 'true'
+        env:
+          GAME_VER: ${{ steps.gplay.outputs.game_ver }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="clean_game/gaku_merged.apk"
+          VALID=false
+          REASON="cache file missing"
+
+          if [[ -s "$APK" ]]; then
+            BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+            if BADGING="$("$BUILD_TOOLS/aapt" dump badging "$APK" 2>&1)"; then
+              APK_PACKAGE="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$BADGING" | head -n 1)"
+              APK_VERSION="$(sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" <<< "$BADGING" | head -n 1)"
+              if [[ "$APK_PACKAGE" == "com.bandainamcoent.idolmaster_gakuen" && "$APK_VERSION" == "$GAME_VER" ]] && \
+                 unzip -Z1 "$APK" | grep -Fxq 'lib/arm64-v8a/libmain.so' && \
+                 unzip -Z1 "$APK" | grep -Fxq 'lib/arm64-v8a/libil2cpp.so'; then
+                VALID=true
+                REASON="package, version, and required Unity libraries match"
+              else
+                REASON="cached APK metadata/version/native libraries do not match the current game"
+              fi
+            else
+              REASON="cached APK could not be parsed by aapt"
+            fi
+          fi
+
+          echo "Cache validation: $REASON"
+          if [[ "$VALID" != true ]]; then
+            rm -f "$APK"
+          fi
+          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
 
       - name: Download & Merge Google Play Splits (upstream-compatible)
-        if: steps.compare.outputs.should_build == 'true' && steps.cache-game.outputs.cache-hit != 'true'
+        if: steps.compare.outputs.should_build == 'true' && steps.validate-game-cache.outputs.valid != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -621,6 +659,19 @@ jobs:
           # Ensure extractNativeLibs=true survived LSPatch so Android materializes
           # libil2cpp.so under ApplicationInfo.nativeLibraryDir at install time.
           BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          # Refuse to publish an APK that Android's signing verifier cannot accept.
+          "$BUILD_TOOLS/apksigner" verify --verbose "$LSPATCHED_APK"
+          FINAL_BADGING="$("$BUILD_TOOLS/aapt" dump badging "$LSPATCHED_APK")"
+          FINAL_PACKAGE="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$FINAL_BADGING" | head -n 1)"
+          FINAL_VERSION="$(sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p" <<< "$FINAL_BADGING" | head -n 1)"
+          if [[ "$FINAL_PACKAGE" != "com.bandainamcoent.idolmaster_gakuen" ]]; then
+            echo "::error::Patched APK has unexpected package ID: $FINAL_PACKAGE"
+            exit 1
+          fi
+          if [[ "$FINAL_VERSION" != "$GAME_VER" ]]; then
+            echo "::error::Patched APK version ($FINAL_VERSION) differs from Google Play version ($GAME_VER)."
+            exit 1
+          fi
           MANIFEST_DUMP="$("$BUILD_TOOLS/aapt" dump xmltree "$LSPATCHED_APK" AndroidManifest.xml)"
           if ! grep -E 'extractNativeLibs.*(0xffffffff|true)' <<< "$MANIFEST_DUMP" >/dev/null; then
             echo "::error::Patched game manifest does not report android:extractNativeLibs=true."
