@@ -700,10 +700,9 @@ jobs:
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
 
             #### Установка:
-            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; для начального запуска не нужны Shizuku, ручной патчинг или отдельная установка менеджера.
-            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API. URL русского API уже установлен по умолчанию.
+            1. Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API.
+            2. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен.
 
-            Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен, Resource Update From API включён и указывает на Gakumas-Translation-Data-RU.
           files: |
             Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk
             Gakumas-Localify-RU.apk
