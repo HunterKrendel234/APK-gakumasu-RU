@@ -237,19 +237,24 @@ jobs:
 
           rm -rf fix_apk extracted_libs
           mkdir -p fix_apk extracted_libs
-          unzip -q "$LSPATCHED_APK" -d fix_apk
+
+          # LSPatch embeds origin.apk using nested/overlapping ZIP ranges. Some Info-ZIP
+          # builds reject that valid layout as a possible ZIP bomb. The APK is produced
+          # by this workflow, so disable only that detector for this trusted input and
+          # extract only native libraries (not the huge assets/lspatch/origin.apk entry).
+          UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -q "$LSPATCHED_APK" 'lib/*' -d fix_apk
 
           # The merged game APK exists even on a cache hit, while gplay_splits may not.
           # Always use it as the primary source of the original native libraries.
           if [[ -s clean_game/gaku_merged.apk ]]; then
-            unzip -oq clean_game/gaku_merged.apk 'lib/*' -d extracted_libs || true
+            UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -oq clean_game/gaku_merged.apk 'lib/*' -d extracted_libs || true
           fi
 
           # Supplement missing entries from the downloaded Google Play split APKs, when available.
           shopt -s nullglob
           split_apks=(gplay_splits/*.apk)
           for apk in "${split_apks[@]}"; do
-            unzip -nq "$apk" 'lib/*' -d extracted_libs || true
+            UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -nq "$apk" 'lib/*' -d extracted_libs || true
           done
 
           restore_missing_native_libs() {
@@ -279,7 +284,7 @@ jobs:
 
             split_apks=(gplay_splits/*.apk)
             for apk in "${split_apks[@]}"; do
-              unzip -nq "$apk" 'lib/*' -d extracted_libs || true
+              UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -nq "$apk" 'lib/*' -d extracted_libs || true
             done
             restore_missing_native_libs
           fi
