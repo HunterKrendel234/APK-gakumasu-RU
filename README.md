@@ -1,1 +1,1 @@
-# TestAPK-gaskumasu
+# Готовая версия игры.
