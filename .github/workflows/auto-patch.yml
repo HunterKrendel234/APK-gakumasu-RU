@@ -62,29 +62,89 @@ jobs:
           echo "trans_html_url=$TRANS_HTML_URL" >> $GITHUB_OUTPUT
 
       - name: Download Tools (apkeep, APKEditor, LSPatch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -Eeuo pipefail
           mkdir -p tools
-          
-          # 1. apkeep
-          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-musl -O tools/apkeep || \
-          wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O tools/apkeep
-          chmod +x tools/apkeep
 
-          # 2. APKEditor: follow Kajaqq/gaku-patcher and use the current release.
-          APKEDITOR_URL=$(curl -fsSL https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '[.assets[]? | select(.name | ascii_downcase | endswith(".jar")) | .browser_download_url] | first // empty')
-          if [ -z "$APKEDITOR_URL" ] || [ "$APKEDITOR_URL" = "null" ]; then
-            echo "::error::Could not find the latest APKEditor JAR release asset."
+          download_asset() {
+            local url="$1"
+            local output="$2"
+            echo "Downloading $(basename "$output") from: $url"
+            rm -f "$output"
+            if ! curl --fail --location --silent --show-error \
+              --retry 4 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 20 --max-time 600 \
+              "$url" --output "$output"; then
+              rm -f "$output"
+              echo "::error::Download failed for $(basename "$output"). Check the URL/status above."
+              return 1
+            fi
+            if [[ ! -s "$output" ]]; then
+              echo "::error::Downloaded file is empty: $output"
+              return 1
+            fi
+          }
+
+          github_api() {
+            curl --fail --location --silent --show-error \
+              --retry 4 --retry-all-errors --retry-delay 2 \
+              --connect-timeout 20 --max-time 60 \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Authorization: Bearer $GH_TOKEN" "$1"
+          }
+
+          # 1. apkeep: resolve the Linux x86_64 asset from release metadata.
+          # Do not guess a musl filename: the current release publishes GNU builds.
+          APKEEP_JSON="$(github_api https://api.github.com/repos/EFForg/apkeep/releases/latest)"
+          APKEEP_URL="$(printf '%s' "$APKEEP_JSON" | jq -r '[.assets[]? | select(.name == "apkeep-x86_64-unknown-linux-gnu") | .browser_download_url] | first // empty')"
+          APKEEP_SHA="$(printf '%s' "$APKEEP_JSON" | jq -r '[.assets[]? | select(.name == "apkeep-x86_64-unknown-linux-gnu") | .digest] | first // empty')"
+          if [[ -z "$APKEEP_URL" || "$APKEEP_URL" == "null" ]]; then
+            echo "::error::No apkeep x86_64 GNU asset in the latest release. Available assets:"
+            printf '%s\n' "$APKEEP_JSON" | jq -r '.assets[]?.name'
             exit 1
           fi
-          wget -q "$APKEDITOR_URL" -O tools/APKEditor.jar
+          download_asset "$APKEEP_URL" tools/apkeep
+          chmod +x tools/apkeep
+          if [[ "$APKEEP_SHA" =~ ^sha256:([a-fA-F0-9]{64})$ ]]; then
+            echo "${BASH_REMATCH[1]}  tools/apkeep" | sha256sum -c -
+          else
+            echo "::warning::GitHub did not provide a SHA-256 digest for apkeep; checking that it is an executable ELF binary."
+          fi
+          file tools/apkeep
+          if ! file tools/apkeep | grep -q 'ELF 64-bit.*x86-64'; then
+            echo "::error::Downloaded apkeep is not an x86_64 Linux ELF executable."
+            exit 1
+          fi
 
-          # 3. Pin LSPatch to the verified stable build used for embedded patching.
-          # Avoid silently changing patcher behavior when the upstream latest release changes.
+          # 2. APKEditor: resolve the JAR and its digest from the official latest release.
+          APKEDITOR_JSON="$(github_api https://api.github.com/repos/REAndroid/APKEditor/releases/latest)"
+          APKEDITOR_ASSET="$(printf '%s' "$APKEDITOR_JSON" | jq -c '[.assets[]? | select(.name | ascii_downcase | endswith(".jar"))][0] // empty')"
+          if [[ -z "$APKEDITOR_ASSET" || "$APKEDITOR_ASSET" == "null" ]]; then
+            echo "::error::Could not find the latest APKEditor JAR asset. Available assets:"
+            printf '%s\n' "$APKEDITOR_JSON" | jq -r '.assets[]?.name'
+            exit 1
+          fi
+          APKEDITOR_URL="$(printf '%s' "$APKEDITOR_ASSET" | jq -r '.browser_download_url')"
+          APKEDITOR_SHA="$(printf '%s' "$APKEDITOR_ASSET" | jq -r '.digest // empty')"
+          download_asset "$APKEDITOR_URL" tools/APKEditor.jar
+          if [[ "$APKEDITOR_SHA" =~ ^sha256:([a-fA-F0-9]{64})$ ]]; then
+            echo "${BASH_REMATCH[1]}  tools/APKEditor.jar" | sha256sum -c -
+          fi
+          jar tf tools/APKEditor.jar >/dev/null
+
+          # 3. LSPatch: pinned stable release with the known SHA-256 digest.
+          # curl provides HTTP status/errors and retries transient GitHub failures;
+          # wget's quiet mode hid which asset returned HTTP 404/403 on the failed run.
           LSPATCH_URL="https://github.com/JingMatrix/LSPatch/releases/download/v1.2-487/lspatch-v1.2-487-release.jar"
-          wget -q --show-progress "$LSPATCH_URL" -O tools/lspatch.jar
+          download_asset "$LSPATCH_URL" tools/lspatch.jar
           echo "d238fdc414d121b7fa454d8b4ccf420df3a8c97d563761861ff92bd9c5da2165  tools/lspatch.jar" | sha256sum -c -
-          ls -lh tools/
+          jar tf tools/lspatch.jar >/dev/null
 
+          echo "All tool downloads and archive checks passed:"
+          ls -lh tools/
       - name: Check Google Play Game Version
         id: gplay
         run: |
@@ -100,7 +160,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg7"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg8"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
