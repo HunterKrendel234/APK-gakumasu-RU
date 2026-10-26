@@ -160,8 +160,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          wget -q "${{ steps.check_upstreams.outputs.plugin_url }}" -O localify_orig.apk || \
-          wget -q "https://github.com/chinosk6/gakuen-imas-localify/releases/latest/download/app-release.apk" -O localify_orig.apk
+          # Динамически ищем любой .apk файл в последнем релизе chinosk6 через GitHub API
+          PLUGIN_URL=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/chinosk6/gakuen-imas-localify/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".apk")) | .browser_download_url] | first // empty')
+          
+          if [ -z "$PLUGIN_URL" ] || [ "$PLUGIN_URL" = "null" ]; then
+            echo "Ошибка: не удалось найти APK в релизах chinosk6, пробуем запасную ссылку..."
+            PLUGIN_URL="https://github.com/chinosk6/gakuen-imas-localify/releases/latest/download/gakuen-imas-localify.apk"
+          fi
+          
+          echo "Скачиваем Localify APK по адресу: $PLUGIN_URL"
+          wget -q "$PLUGIN_URL" -O localify_orig.apk
 
           curl -sL -H "Authorization: Bearer $GH_TOKEN" "${{ steps.check_upstreams.outputs.trans_url }}" -o ru_trans.zip
 
