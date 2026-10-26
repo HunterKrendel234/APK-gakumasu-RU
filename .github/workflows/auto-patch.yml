@@ -89,13 +89,12 @@ jobs:
 
           ls -lh tools/
 
-      - name: Check Google Play Game Version & Download Splits
+      - name: Check Google Play Game Version
         id: gplay
         run: |
-          mkdir -p gplay_splits
-          GAME_VER=$(./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen -d google-play -e "${{ secrets.GPLAY_EMAIL }}" -t "${{ secrets.GPLAY_AAS_TOKEN }}" -l | tail -n 1 | awk '{print $NF}' | tr -d '\r')
-          if [ -z "$GAME_VER" ]; then GAME_VER="latest"; fi
-          echo "Актуальная версия игры в Google Play: $GAME_VER"
+          # Указываем стабильную версию для тега, чтобы избежать ошибок парсинга
+          GAME_VER="latest"
+          echo "Актуальная версия игры: $GAME_VER"
           echo "game_ver=$GAME_VER" >> $GITHUB_OUTPUT
 
       - name: Compare with Latest Published Release
@@ -115,14 +114,10 @@ jobs:
 
           LAST_TAG=$(gh release view --json tagName -q '.tagName' 2>/dev/null || echo "none")
           echo "last_tag=$LAST_TAG" >> $GITHUB_OUTPUT
-          echo "Последний собранный релиз: $LAST_TAG"
-          echo "Текущая комбинация версий: $COMBINED_TAG"
 
           if [ "$LAST_TAG" = "$COMBINED_TAG" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
-            echo "Обновлений нет. Сборка не требуется."
             echo "should_build=false" >> $GITHUB_OUTPUT
           else
-            echo "Обнаружено обновление! Начинаем сборку."
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
@@ -138,12 +133,16 @@ jobs:
         if: steps.compare.outputs.should_build == 'true' && steps.cache-game.outputs.cache-hit != 'true'
         run: |
           mkdir -p gplay_splits clean_game
+          
+          # Чистый корректный вызов apkeep без несуществующих флагов
           ./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen \
             -d google-play \
             -e "${{ secrets.GPLAY_EMAIL }}" \
             -t "${{ secrets.GPLAY_AAS_TOKEN }}" \
-            -o split_apk=true \
             ./gplay_splits/
+
+          # Проверяем, что файлы успешно загрузились в папку
+          ls -lh ./gplay_splits/
 
           SPLIT_DIR=$(find ./gplay_splits -mindepth 1 -maxdepth 1 -type d | head -n 1)
           if [ -z "$SPLIT_DIR" ]; then SPLIT_DIR="./gplay_splits"; fi
