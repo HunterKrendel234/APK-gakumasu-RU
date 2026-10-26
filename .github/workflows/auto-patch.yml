@@ -397,7 +397,7 @@ jobs:
               indent = match.group(1)
               original_call = match.group(0)
               return (
-                  f'{indent}Log.i(TAG, "Localify initHook begin: il2cpp=${{app.applicationInfo.nativeLibraryDir}}/libil2cpp.so, localizationRoot=${{File(app.filesDir, FilesChecker.localizationFilesDir).absolutePath}}")\n'
+                  f'{indent}Log.i(TAG, "Localify initHook begin: il2cpp=" + app.applicationInfo.nativeLibraryDir + "/libil2cpp.so, localizationRoot=" + File(app.filesDir, FilesChecker.localizationFilesDir).absolutePath)\n'
                   + original_call
                   + f'\n{indent}Log.i(TAG, "Localify initHook call returned")'
               )
