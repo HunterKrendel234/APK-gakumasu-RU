@@ -70,8 +70,13 @@ jobs:
           wget -q https://github.com/EFForg/apkeep/releases/latest/download/apkeep-x86_64-unknown-linux-gnu -O tools/apkeep
           chmod +x tools/apkeep
 
-          # 2. APKEditor
-          wget -q https://github.com/REAndroid/APKEditor/releases/download/V1.4.1/APKEditor-1.4.1.jar -O tools/APKEditor.jar
+          # 2. APKEditor: follow Kajaqq/gaku-patcher and use the current release.
+          APKEDITOR_URL=$(curl -fsSL https://api.github.com/repos/REAndroid/APKEditor/releases/latest | jq -r '[.assets[]? | select(.name | ascii_downcase | endswith(".jar")) | .browser_download_url] | first // empty')
+          if [ -z "$APKEDITOR_URL" ] || [ "$APKEDITOR_URL" = "null" ]; then
+            echo "::error::Could not find the latest APKEditor JAR release asset."
+            exit 1
+          fi
+          wget -q "$APKEDITOR_URL" -O tools/APKEditor.jar
 
           # 3. LSPatch (JingMatrix)
           LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".jar")) | .browser_download_url] | first // empty')
@@ -122,23 +127,94 @@ jobs:
         uses: actions/cache@v4
         with:
           path: clean_game/gaku_merged.apk
-          key: gakumas-clean-apk-${{ steps.gplay.outputs.game_ver }}
+          # Bump this key when changing the split-download/merge pipeline so an old
+          # merged APK without native libraries cannot be restored from cache.
+          key: gakumas-clean-apk-v3-${{ steps.gplay.outputs.game_ver }}
 
-      - name: Download & Merge Game Splits (Fixed lib/arm64)
+      - name: Download & Merge Google Play Splits (upstream-compatible)
         if: steps.compare.outputs.should_build == 'true' && steps.cache-game.outputs.cache-hit != 'true'
+        shell: bash
         run: |
-          mkdir -p gplay_splits clean_game
-          
-          ./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen \
+          set -euo pipefail
+
+          APP_ID="com.bandainamcoent.idolmaster_gakuen"
+          DOWNLOAD_ROOT="gplay_splits"
+          APP_SPLITS_DIR="$DOWNLOAD_ROOT/$APP_ID"
+          mkdir -p "$DOWNLOAD_ROOT" clean_game
+
+          # Match Kajaqq/gaku-patcher: explicitly request Play split APKs and use
+          # the JP device/locale configuration, instead of silently downloading a
+          # single APK that may omit the ARM64 native-library split.
+          ./tools/apkeep -a "$APP_ID" \
             -d google-play \
+            -o "locale=jp,timezone=UTC+9,split_apk=1,include_additional_files=true" \
             -e "${{ secrets.GPLAY_EMAIL }}" \
             -t "${{ secrets.GPLAY_AAS_TOKEN }}" \
-            ./gplay_splits/
+            "$DOWNLOAD_ROOT"
 
-          ls -lh ./gplay_splits/
+          # apkeep normally creates <destination>/<package-id>/. Be tolerant of
+          # versions that instead place APKs directly in the destination.
+          if [[ ! -d "$APP_SPLITS_DIR" ]] || ! find "$APP_SPLITS_DIR" -type f -name '*.apk' -print -quit 2>/dev/null | grep -q .; then
+            if find "$DOWNLOAD_ROOT" -maxdepth 1 -type f -name '*.apk' -print -quit | grep -q .; then
+              APP_SPLITS_DIR="$DOWNLOAD_ROOT"
+            else
+              FOUND_DIR="$(find "$DOWNLOAD_ROOT" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+              if [[ -n "$FOUND_DIR" ]] && find "$FOUND_DIR" -type f -name '*.apk' -print -quit | grep -q .; then
+                APP_SPLITS_DIR="$FOUND_DIR"
+              fi
+            fi
+          fi
 
-          # Гарантированно указываем путь со всеми скачанными сплитами для APKEditor
-          java -jar tools/APKEditor.jar m -i ./gplay_splits -o clean_game/gaku_merged.apk
+          mapfile -t SPLIT_APKS < <(find "$APP_SPLITS_DIR" -type f -name '*.apk' -print | sort)
+          if [[ ${#SPLIT_APKS[@]} -eq 0 ]]; then
+            echo "::error::apkeep did not download any APK files. Contents of $DOWNLOAD_ROOT:"
+            find "$DOWNLOAD_ROOT" -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+
+          echo "APKEditor input directory: $APP_SPLITS_DIR"
+          printf 'Downloaded APK: %s\n' "${SPLIT_APKS[@]}"
+
+          # Fail before patching if the original split set does not include the
+          # game engine's ARM64 library. This pinpoints a download/merge problem.
+          HAS_MAIN_IN_INPUT=false
+          for apk in "${SPLIT_APKS[@]}"; do
+            if unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libmain.so' >/dev/null; then
+              HAS_MAIN_IN_INPUT=true
+              echo "Found lib/arm64-v8a/libmain.so in source split: $apk"
+            fi
+          done
+          if [[ "$HAS_MAIN_IN_INPUT" != true ]]; then
+            echo "::error::The downloaded Google Play APK set contains no lib/arm64-v8a/libmain.so."
+            echo "This is a source-download/configuration issue; patching cannot restore a library that was never downloaded."
+            exit 1
+          fi
+
+          # APKEditor merge step, as in Kajaqq/gaku-patcher and the fullpie project.
+          # Keep native libraries uncompressed and aligned as requested by the manifest.
+          java -jar tools/APKEditor.jar m \
+            -i "$APP_SPLITS_DIR" \
+            -o clean_game/gaku_merged.apk \
+            -extractNativeLibs false
+
+          python3 - <<'PYVERIFY'
+          import sys, zipfile
+          apk_path = "clean_game/gaku_merged.apk"
+          required = "lib/arm64-v8a/libmain.so"
+          try:
+              with zipfile.ZipFile(apk_path) as apk:
+                  entries = {item.filename: item for item in apk.infolist()}
+                  item = entries.get(required)
+                  if item is None or item.file_size == 0:
+                      native = [n for n in entries if n.startswith("lib/") and n.endswith(".so")]
+                      print(f"ERROR: {required} is absent/empty after APKEditor merge", file=sys.stderr)
+                      print("Merged native libraries:", *native[:100], sep="\n", file=sys.stderr)
+                      raise SystemExit(1)
+                  print(f"Verified merged {required}: {item.file_size:,} bytes; compression={item.compress_type}")
+          except zipfile.BadZipFile as exc:
+              raise SystemExit(f"ERROR: APKEditor produced an invalid APK: {exc}")
+          PYVERIFY
+
           ls -lh clean_game/gaku_merged.apk
 
       - name: Restore Keystore
@@ -209,22 +285,29 @@ jobs:
             --key-pass "pass:${{ secrets.KEY_PASS }}" \
             Gakumas-Localify-RU.apk
 
-      - name: Patch Game APK with LSPatch & Repair Native Libraries
+      - name: Patch Game APK with LSPatch (publish its output unchanged)
         if: steps.compare.outputs.should_build == 'true'
         env:
-          GPLAY_EMAIL: ${{ secrets.GPLAY_EMAIL }}
-          GPLAY_AAS_TOKEN: ${{ secrets.GPLAY_AAS_TOKEN }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.KEY_PASS }}
+          GAME_VER: ${{ steps.gplay.outputs.game_ver }}
         shell: bash
         run: |
           set -euo pipefail
 
+          # Do not unzip, zip, zipalign, or re-sign LSPatch's output afterwards.
+          # LSPatch can intentionally use overlapping ZIP ranges for origin.apk;
+          # standard ZIP rewrite tools may corrupt that layout. Both referenced
+          # upstream workflows publish the direct LSPatch output.
+          rm -rf patched_out
           mkdir -p patched_out
           java -jar tools/lspatch.jar clean_game/gaku_merged.apk \
             -m Gakumas-Localify-RU.apk \
-            -k release.jks "${{ secrets.KS_PASS }}" "${{ secrets.KEY_ALIAS }}" "${{ secrets.KEY_PASS }}" \
+            -k release.jks "$KS_PASS" "$KEY_ALIAS" "$KEY_PASS" \
             -o patched_out/
 
-          LSPATCHED_APK="$(find patched_out -type f -name "*-lspatched.apk" -print -quit)"
+          LSPATCHED_APK="$(find patched_out -type f -name '*-lspatched.apk' -print -quit)"
           if [[ -z "$LSPATCHED_APK" ]]; then
             LSPATCHED_APK="$(find patched_out -type f -name '*.apk' -print -quit)"
           fi
@@ -233,123 +316,16 @@ jobs:
             find patched_out -maxdepth 2 -type f -print || true
             exit 1
           fi
-          echo "LSPatch output: $LSPATCHED_APK"
 
-          rm -rf fix_apk extracted_libs
-          mkdir -p fix_apk extracted_libs
+          OUTPUT_APK="Gakumas-RU-${GAME_VER}.apk"
+          cp -- "$LSPATCHED_APK" "$OUTPUT_APK"
+          echo "Published artifact candidate: $OUTPUT_APK"
+          ls -lh "$LSPATCHED_APK" "$OUTPUT_APK"
+          sha256sum "$OUTPUT_APK"
 
-          # LSPatch embeds origin.apk using nested/overlapping ZIP ranges. Some Info-ZIP
-          # builds reject that valid layout as a possible ZIP bomb. The APK is produced
-          # by this workflow, so disable only that detector for this trusted input and
-          # extract only native libraries (not the huge assets/lspatch/origin.apk entry).
-          UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -q "$LSPATCHED_APK" 'lib/*' -d fix_apk
-
-          # The merged game APK exists even on a cache hit, while gplay_splits may not.
-          # Always use it as the primary source of the original native libraries.
-          if [[ -s clean_game/gaku_merged.apk ]]; then
-            UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -oq clean_game/gaku_merged.apk 'lib/*' -d extracted_libs || true
-          fi
-
-          # Supplement missing entries from the downloaded Google Play split APKs, when available.
-          shopt -s nullglob
-          split_apks=(gplay_splits/*.apk)
-          for apk in "${split_apks[@]}"; do
-            UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -nq "$apk" 'lib/*' -d extracted_libs || true
-          done
-
-          restore_missing_native_libs() {
-            [[ -d extracted_libs/lib ]] || return 0
-            while IFS= read -r -d '' source_lib; do
-              relative_path="${source_lib#extracted_libs/}"
-              target_lib="fix_apk/$relative_path"
-              if [[ ! -s "$target_lib" ]]; then
-                mkdir -p "$(dirname "$target_lib")"
-                cp -p "$source_lib" "$target_lib"
-                echo "Restored missing native library: $relative_path"
-              fi
-            done < <(find extracted_libs/lib -type f -name '*.so' -print0)
-          }
-          restore_missing_native_libs
-
-          # Older cached builds may not have gplay_splits/. If the merged APK also lacks
-          # libmain.so, download the splits on demand rather than publish a broken APK.
-          if [[ ! -s fix_apk/lib/arm64-v8a/libmain.so && ${#split_apks[@]} -eq 0 ]]; then
-            echo "arm64-v8a/libmain.so is still missing; downloading original splits for recovery..."
-            mkdir -p gplay_splits
-            ./tools/apkeep -a com.bandainamcoent.idolmaster_gakuen \
-              -d google-play \
-              -e "$GPLAY_EMAIL" \
-              -t "$GPLAY_AAS_TOKEN" \
-              ./gplay_splits/
-
-            split_apks=(gplay_splits/*.apk)
-            for apk in "${split_apks[@]}"; do
-              UNZIP_DISABLE_ZIPBOMB_DETECTION=TRUE unzip -nq "$apk" 'lib/*' -d extracted_libs || true
-            done
-            restore_missing_native_libs
-          fi
-
-          if [[ ! -s fix_apk/lib/arm64-v8a/libmain.so ]]; then
-            echo "::error::lib/arm64-v8a/libmain.so is missing after restoration. Refusing to publish a broken APK."
-            echo "Native libraries in patched APK:"
-            find fix_apk/lib -type f -name '*.so' -print 2>/dev/null || true
-            echo "Native libraries found in original package:"
-            find extracted_libs/lib -type f -name '*.so' -print 2>/dev/null || true
-            exit 1
-          fi
-          echo "Verified source library:"
-          ls -lh fix_apk/lib/arm64-v8a/libmain.so
-
-          # Do not rebuild the entire ZIP: a full `zip -r` can change compression of
-          # resources.arsc and native libraries. Update only lib/, preserving other APK entries.
-          cp "$LSPATCHED_APK" final_unaligned.apk
-          # Remove existing lib/ entries first so zip cannot skip a same-timestamp entry.
-          # The extracted fix_apk/lib tree contains both preserved LSPatch libs and restored game libs.
-          zip -q -d final_unaligned.apk 'lib/*' || true
-          # Re-add only lib/, with every native library stored uncompressed.
-          find fix_apk/lib -type f -exec touch -m {} +
-          find fix_apk/lib -type d -exec touch -m {} +
-          (
-            cd fix_apk
-            zip -q -0 -r ../final_unaligned.apk lib
-          )
-
-          # Check that libmain.so is present and all packaged native libraries are STORED.
-          python3 - <<'PY'
-          import zipfile
-          apk_path = "final_unaligned.apk"
-          required = "lib/arm64-v8a/libmain.so"
-          with zipfile.ZipFile(apk_path) as apk:
-              entries = {entry.filename: entry for entry in apk.infolist()}
-              if required not in entries or entries[required].file_size == 0:
-                  raise SystemExit(f"::error::{required} is missing or empty in final APK")
-              compressed = [
-                  entry.filename for entry in apk.infolist()
-                  if entry.filename.startswith("lib/")
-                  and entry.filename.endswith(".so")
-                  and entry.compress_type != zipfile.ZIP_STORED
-              ]
-              if compressed:
-                  raise SystemExit("::error::Compressed native libraries found: " + ", ".join(compressed[:20]))
-              print(f"Verified {required} ({entries[required].file_size:,} bytes); all .so entries are uncompressed.")
-          PY
-
-          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
-          "$BUILD_TOOLS/zipalign" -P 16 -f 4 final_unaligned.apk final_aligned.apk
-          "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 final_aligned.apk
-
-          OUTPUT_APK="Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
-          "$BUILD_TOOLS/apksigner" sign \
-            --ks release.jks \
-            --ks-pass "pass:${{ secrets.KS_PASS }}" \
-            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
-            --key-pass "pass:${{ secrets.KEY_PASS }}" \
-            --out "$OUTPUT_APK" \
-            final_aligned.apk
-
-          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$OUTPUT_APK"
-          "$BUILD_TOOLS/zipalign" -c -P 16 -v 4 "$OUTPUT_APK"
-          ls -lh "$OUTPUT_APK"
+          # Validate the merged source, not LSPatch's overlapping ZIP layout.
+          # The source APK check in the prior step guarantees libmain.so was present
+          # before patching. Preserve LSPatch output byte-for-byte after this point.
 
       - name: Publish GitHub Release
         if: steps.compare.outputs.should_build == 'true'
