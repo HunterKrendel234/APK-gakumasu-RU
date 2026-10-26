@@ -78,15 +78,13 @@ jobs:
           fi
           wget -q "$APKEDITOR_URL" -O tools/APKEditor.jar
 
-          # 3. LSPatch (JingMatrix)
-          LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".jar")) | .browser_download_url] | first // empty')
-          if [ -z "$LSPATCH_URL" ] || [ "$LSPATCH_URL" = "null" ]; then
-            LSPATCH_URL=$(curl -s https://api.github.com/repos/JingMatrix/LSPatch/releases/latest | jq -r '[.assets[]? | select(.name | endswith(".zip")) | .browser_download_url] | first // empty')
-            wget -q "$LSPATCH_URL" -O tools/lspatch.zip
-            unzip -q -j tools/lspatch.zip "*.jar" -d tools/
-            mv tools/*.jar tools/lspatch.jar 2>/dev/null || true
-          else
-            wget -q "$LSPATCH_URL" -O tools/lspatch.jar
+          # 3. LSPatch: pin the verified stable CLI so option names/output layout do not drift.
+          LSPATCH_URL="https://github.com/JingMatrix/LSPatch/releases/download/v1.2/lspatch-v1.2-487-release.jar"
+          curl -fL --retry 3 --retry-delay 2 "$LSPATCH_URL" -o tools/lspatch.jar
+          echo "d238fdc414d121b7fa454d8b4ccf420df3a8c97d563761861ff92bd9c5da2165  tools/lspatch.jar" | sha256sum -c -
+          if ! java -jar tools/lspatch.jar --help 2>&1 | grep -q -- '--extract-libs'; then
+            echo "::error::Pinned LSPatch CLI does not expose --extract-libs; refusing to build an APK with unverified native-library packaging."
+            exit 1
           fi
 
           ls -lh tools/
@@ -106,7 +104,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg5"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg6"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -175,42 +173,56 @@ jobs:
           echo "APKEditor input directory: $APP_SPLITS_DIR"
           printf 'Downloaded APK: %s\n' "${SPLIT_APKS[@]}"
 
-          # Fail before patching if the original split set does not include the
-          # game engine's ARM64 library. This pinpoints a download/merge problem.
-          HAS_MAIN_IN_INPUT=false
+          # Localify's native hook opens libil2cpp.so via
+          # ApplicationInfo.nativeLibraryDir/libil2cpp.so. Both Unity libraries
+          # must therefore survive the merge and be extractable by Android.
+          declare -A REQUIRED_GAME_LIBS=(
+            [lib/arm64-v8a/libmain.so]=false
+            [lib/arm64-v8a/libil2cpp.so]=false
+          )
           for apk in "${SPLIT_APKS[@]}"; do
-            if unzip -Z1 "$apk" | grep -Fx 'lib/arm64-v8a/libmain.so' >/dev/null; then
-              HAS_MAIN_IN_INPUT=true
-              echo "Found lib/arm64-v8a/libmain.so in source split: $apk"
+            while IFS= read -r entry; do
+              if [[ -n "${REQUIRED_GAME_LIBS[$entry]+x}" ]]; then
+                REQUIRED_GAME_LIBS[$entry]=true
+                echo "Found $entry in source split: $apk"
+              fi
+            done < <(unzip -Z1 "$apk")
+          done
+          for required in "${!REQUIRED_GAME_LIBS[@]}"; do
+            if [[ "${REQUIRED_GAME_LIBS[$required]}" != true ]]; then
+              echo "::error::The downloaded Google Play APK set does not contain $required."
+              echo "This is a source-download/configuration issue; patching cannot restore a missing Unity library."
+              exit 1
             fi
           done
-          if [[ "$HAS_MAIN_IN_INPUT" != true ]]; then
-            echo "::error::The downloaded Google Play APK set contains no lib/arm64-v8a/libmain.so."
-            echo "This is a source-download/configuration issue; patching cannot restore a library that was never downloaded."
-            exit 1
-          fi
 
-          # APKEditor merge step, as in Kajaqq/gaku-patcher and the fullpie project.
-          # Keep native libraries uncompressed and aligned as requested by the manifest.
+          # IMPORTANT: Localify's native initializer expects libil2cpp.so in nativeLibraryDir.
+          # Setting extractNativeLibs=false leaves libraries inside the APK on modern Android,
+          # so the game may launch while the Localify native hook cannot open that filesystem path.
+          # Force extraction-compatible packaging here and again in LSPatch below.
           java -jar tools/APKEditor.jar m \
             -i "$APP_SPLITS_DIR" \
             -o clean_game/gaku_merged.apk \
-            -extractNativeLibs false
+            -extractNativeLibs true
 
           python3 - <<'PYVERIFY'
           import sys, zipfile
           apk_path = "clean_game/gaku_merged.apk"
-          required = "lib/arm64-v8a/libmain.so"
+          required = (
+              "lib/arm64-v8a/libmain.so",
+              "lib/arm64-v8a/libil2cpp.so",
+          )
           try:
               with zipfile.ZipFile(apk_path) as apk:
                   entries = {item.filename: item for item in apk.infolist()}
-                  item = entries.get(required)
-                  if item is None or item.file_size == 0:
-                      native = [n for n in entries if n.startswith("lib/") and n.endswith(".so")]
-                      print(f"ERROR: {required} is absent/empty after APKEditor merge", file=sys.stderr)
-                      print("Merged native libraries:", *native[:100], sep="\n", file=sys.stderr)
-                      raise SystemExit(1)
-                  print(f"Verified merged {required}: {item.file_size:,} bytes; compression={item.compress_type}")
+                  for name in required:
+                      item = entries.get(name)
+                      if item is None or item.file_size == 0:
+                          native = [n for n in entries if n.startswith("lib/") and n.endswith(".so")]
+                          print(f"ERROR: {name} is absent/empty after APKEditor merge", file=sys.stderr)
+                          print("Merged native libraries:", *native[:100], sep="\n", file=sys.stderr)
+                          raise SystemExit(1)
+                      print(f"Verified merged {name}: {item.file_size:,} bytes; compression={item.compress_type}")
           except zipfile.BadZipFile as exc:
               raise SystemExit(f"ERROR: APKEditor produced an invalid APK: {exc}")
           PYVERIFY
@@ -316,7 +328,6 @@ jobs:
           set_bool_property(gakumas_model, "replaceTexture", False)
           set_bool_property(gakumas_model, "useMasterTrans", True)
           set_bool_property(gakumas_model, "enabled", True, required=False)
-          set_bool_property(gakumas_model, "forceExportResource", False, required=False)
 
           # ProgramConfig drives the Resource Settings screen and API updater.
           # Enable API updates by default and make the RU release API the initial URL.
@@ -335,49 +346,6 @@ jobs:
               raise SystemExit(f"Expected exactly one useAPIAssetsURL default in {program_model}, found {url_count}")
           program_model.write_text(program_text, encoding="utf-8")
           print(f"Set {program_model}: useAPIAssetsURL={ru_api}")
-
-          # LSPatch embeds the module APK, but it does not install the Localify app
-          # itself. Upstream GakumasHookMain requests config by launching
-          # io.github.chinosk.gakumas.localify.TranslucentActivity. When that launch
-          # fails, upstream falls back through a detached Activity(); with our
-          # useAPIAssets=true default that path can dereference fakeActivity.filesDir
-          # and abort before initHook() is reached. Use the real game Application
-          # Context for the bundled-RU fallback, and keep the manager's normal
-          # API-config path untouched when it successfully supplies gkmsData.
-          hook_models = list((root / "app/src/main/java").rglob("GakumasHookMain.kt"))
-          if len(hook_models) != 1:
-              raise SystemExit(f"Expected one GakumasHookMain.kt, found {len(hook_models)}")
-          hook_main = hook_models[0]
-          hook_text = hook_main.read_text(encoding="utf-8")
-          fallback_pattern = re.compile(
-              r'catch\s*\(e:\s*Exception\)\s*\{\s*'
-              r'getConfigError\s*=\s*e\s*'
-              r'val\s+fakeActivity\s*=\s*Activity\(\)\.apply\s*\{\s*'
-              r'intent\s*=\s*Intent\(\)\.apply\s*\{\s*'
-              r'putExtra\("gkmsData",\s*"\{\}"\)\s*\}\s*\}\s*'
-              r'initGkmsConfig\(fakeActivity\)\s*\}',
-              re.DOTALL,
-          )
-          fallback_replacement = '''catch (e: Exception) {
-                      getConfigError = e
-                      Log.e(TAG, "Unable to request Localify settings; using bundled translation fallback", e)
-                      gkmsDataInited = true
-                      FilesChecker.initAndCheck(activity.filesDir, modulePath)
-                      loadConfig("{}")
-                  }'''
-          hook_text, fallback_count = fallback_pattern.subn(lambda _: fallback_replacement, hook_text)
-          if fallback_count != 1:
-              raise SystemExit(
-                  "Could not safely patch GakumasHookMain config fallback: "
-                  f"expected one detached-Activity fallback, found {fallback_count}. "
-                  "Upstream code may have changed; inspect GakumasHookMain.kt before building."
-              )
-          hook_main.write_text(hook_text, encoding="utf-8")
-          if "FilesChecker.initAndCheck(activity.filesDir, modulePath)" not in hook_text:
-              raise SystemExit("Bundled fallback no longer initializes FilesChecker with a real Context")
-          if "initGkmsConfig(fakeActivity)" in hook_text:
-              raise SystemExit("Unsafe fake Activity config fallback remains in GakumasHookMain.kt")
-          print("Patched GakumasHookMain: safe real-Context fallback for embedded RU assets")
 
           # Also replace the fallback URL used when the saved URL is empty.
           values_dir = root / "app/src/main/res"
@@ -420,11 +388,6 @@ jobs:
               raise SystemExit("Replace Texture is not disabled by default")
           if not re.search(r"var\s+useMasterTrans\s*:\s*Boolean\s*=\s*true", cfg):
               raise SystemExit("MasterDB localization is not enabled by default")
-          hook_cfg = hook_main.read_text(encoding="utf-8")
-          if "FilesChecker.initAndCheck(activity.filesDir, modulePath)" not in hook_cfg or "loadConfig(\"{}\")" not in hook_cfg:
-              raise SystemExit("Safe Localify integration-mode fallback did not survive source patch")
-          if "initGkmsConfig(fakeActivity)" in hook_cfg:
-              raise SystemExit("Unsafe fake Activity fallback survived source patch")
           for required in ("localization.json",):
               p = target_assets / "local-files" / required
               if not p.is_file() or p.stat().st_size == 0:
@@ -523,6 +486,9 @@ jobs:
           java -jar tools/lspatch.jar clean_game/gaku_merged.apk \
             -m Gakumas-Localify-RU.apk \
             -k release.jks "$KS_PASS" "$KEY_ALIAS" "$KEY_PASS" \
+            --extract-libs \
+            --force \
+            --verbose \
             -o patched_out/
 
           LSPATCHED_APK="$(find patched_out -type f -name '*-lspatched.apk' -print -quit)"
@@ -536,14 +502,59 @@ jobs:
           fi
 
           OUTPUT_APK="Gakumas-RU-${GAME_VER}.apk"
+
+          # Verify the *patched* APK before publishing it. A successful LSPatch exit
+          # alone is insufficient: some patcher builds can skip an invalid module.
+          python3 - "$LSPATCHED_APK" Gakumas-Localify-RU.apk <<'PYPATCHVERIFY'
+          import hashlib, sys, zipfile
+          patched_path, module_path = sys.argv[1:]
+          required = (
+              "lib/arm64-v8a/libmain.so",
+              "lib/arm64-v8a/libil2cpp.so",
+          )
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+          try:
+              with zipfile.ZipFile(patched_path) as patched, open(module_path, "rb") as module_file:
+                  names = set(patched.namelist())
+                  for name in required:
+                      info = patched.getinfo(name) if name in names else None
+                      if info is None or info.file_size == 0:
+                          raise SystemExit(f"ERROR: LSPatch output is missing {name}; cannot initialize Localify's native hook")
+                  module_hash = sha256(module_file.read())
+                  embedded = [
+                      name for name in names
+                      if name.startswith("assets/lspatch/modules/") and name.endswith(".apk")
+                  ]
+                  matches = [name for name in embedded if sha256(patched.read(name)) == module_hash]
+                  if not matches:
+                      raise SystemExit(
+                          "ERROR: The generated game APK does not contain the exact built Localify APK. "
+                          f"Embedded module entries found: {embedded}"
+                      )
+                  print("Verified patched game native libraries:", ", ".join(required))
+                  print("Verified exact embedded Localify module:", ", ".join(matches))
+          except zipfile.BadZipFile as exc:
+              raise SystemExit(f"ERROR: LSPatch produced an invalid APK: {exc}")
+          PYPATCHVERIFY
+
+          # Ensure extractNativeLibs=true survived LSPatch so Android materializes
+          # libil2cpp.so under ApplicationInfo.nativeLibraryDir at install time.
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          MANIFEST_DUMP="$("$BUILD_TOOLS/aapt" dump xmltree "$LSPATCHED_APK" AndroidManifest.xml)"
+          if ! grep -E 'extractNativeLibs.*(0xffffffff|true)' <<< "$MANIFEST_DUMP" >/dev/null; then
+            echo "::error::Patched game manifest does not report android:extractNativeLibs=true."
+            grep -n -A2 -B2 'extractNativeLibs' <<< "$MANIFEST_DUMP" || true
+            exit 1
+          fi
+          echo "Verified android:extractNativeLibs=true in patched game APK."
+
+          # Publish LSPatch's APK byte-for-byte. Do not re-zip, align or re-sign it
+          # afterwards because LSPatch may use overlapping ZIP ranges for origin.apk.
           cp -- "$LSPATCHED_APK" "$OUTPUT_APK"
           echo "Published artifact candidate: $OUTPUT_APK"
           ls -lh "$LSPATCHED_APK" "$OUTPUT_APK"
           sha256sum "$OUTPUT_APK"
-
-          # Validate the merged source, not LSPatch's overlapping ZIP layout.
-          # The source APK check in the prior step guarantees libmain.so was present
-          # before patching. Preserve LSPatch output byte-for-byte after this point.
 
       - name: Publish GitHub Release
         if: steps.compare.outputs.should_build == 'true'
@@ -558,9 +569,8 @@ jobs:
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
 
             #### Установка:
-            1. Установите **оба APK**: `Gakumas-Localify-RU.apk` и `Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`.
-            2. Откройте Localify и запускайте игру кнопкой запуска внутри приложения. Это передаёт игре сохранённые параметры Localify и позволяет применить обновлённый пакет из RU API. Если Android блокирует запуск другого приложения, разрешите Localify запуск игры/открытие других приложений.
-            3. Русский пакет также встроен в APK игры и используется как fallback, когда приложение Localify недоступно. В таком режиме динамические параметры и API-обновления Localify переданы не будут.
+            1. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен; для начального запуска не нужны Shizuku, ручной патчинг или отдельная установка менеджера.
+            2. *(Опционально)* Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API. URL русского API уже установлен по умолчанию.
 
             Встроенные настройки: Fast Initialization выключен, MasterDB Localization включен, Replace Texture выключен, Resource Update From API включён и указывает на Gakumas-Translation-Data-RU.
           files: |
