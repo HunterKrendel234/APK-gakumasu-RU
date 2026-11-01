@@ -736,7 +736,7 @@ jobs:
               CHANGES="${CHANGES}🛠️ **Обновился Gakumas Localify (chinosk6):** \`${OLD_PLUGIN:-?}\` ➔ \`${CUR_PLUGIN}\`\n"
             fi
             if [ "$OLD_TRANS" != "$CUR_TRANS" ]; then
-              CHANGES="${CHANGES}🇷🇺 **Обновился русский перевод:** \`${OLD_TRANS:-?}\` ➔ \`${CUR_TRANS}\`\n"
+              CHANGES="${CHANGES}🇷🇺 **Обновился русский перевод:** \`${OLD_TRANS:-?}\` ➔ \`${CUR_TRANS}\`\n\n**Вам не обязательно переустанавливать игру. Зайдите в Localify и обновите перевод.**\n"
             fi
             if [ -z "$CHANGES" ]; then
               CHANGES="🔄 **Принудительная пересборка APK** (версии компонентов не менялись)"
