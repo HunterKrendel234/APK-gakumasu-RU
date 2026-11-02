@@ -34,12 +34,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Получаем реальную версию/тег исходников плагина chinosk6 с его git-сервера
-          PLUGIN_INFO=$(curl -s https://git.chinosk6.cn/api/v1/repos/chinosk/gkms-local/releases/latest 2>/dev/null)
-          PLUGIN_TAG=$(echo "$PLUGIN_INFO" | jq -r '.tag_name // empty')
+          # 1. Получаем реальную версию плагина напрямую из app/build.gradle в ветке main
+          # (chinosk6 обновляет versionName в main без создания релизов в Gitea, где релиз застрял на v3.5.0)
+          GRADLE_CONTENT=$(curl -fsSL "https://git.chinosk6.cn/chinosk/gkms-local/raw/branch/main/app/build.gradle" 2>/dev/null || true)
+          PLUGIN_TAG=$(echo "$GRADLE_CONTENT" | sed -n 's/.*versionName[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+
           if [ -z "$PLUGIN_TAG" ] || [ "$PLUGIN_TAG" = "null" ]; then
-            # Если тегов нет в API, берем последний commit sha из репозитория
-            PLUGIN_TAG=$(curl -s https://git.chinosk6.cn/api/v1/repos/chinosk/gkms-local/commits?limit=1 2>/dev/null | jq -r '.[0].sha[0:7]' // "v1.2.0")
+            PLUGIN_INFO=$(curl -s https://git.chinosk6.cn/api/v1/repos/chinosk/gkms-local/releases/latest 2>/dev/null)
+            PLUGIN_TAG=$(echo "$PLUGIN_INFO" | jq -r '.tag_name // empty')
+          fi
+          if [ -z "$PLUGIN_TAG" ] || [ "$PLUGIN_TAG" = "null" ]; then
+            PLUGIN_TAG=$(curl -s https://git.chinosk6.cn/api/v1/repos/chinosk/gkms-local/commits?limit=1 2>/dev/null | jq -r '.[0].sha[0:7]' // "v3.6.1")
           fi
           PLUGIN_HTML_URL="https://git.chinosk6.cn/chinosk/gkms-local"
 
@@ -95,10 +100,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Read the public Google Play listing using the same data path as
-          # Kajaqq/gaku-patcher's play_ver_check/app.py. No third-party Python
-          # packages are required. Fail closed if Google changes the page format,
-          # rather than publishing a release with a fake "latest" or "unknown" version.
           python3 - <<'PYVERSION'
           import json
           import os
@@ -136,8 +137,6 @@ jobs:
           if html is None:
               raise SystemExit(f"::error::Could not fetch the Google Play listing after 3 attempts: {last_error}")
 
-          # These expressions and the ds:5 JSON path follow the upstream
-          # play_ver_check implementation used by Kajaqq/gaku-patcher.
           script_re = re.compile(r"AF_initDataCallback[\s\S]*?</script")
           key_re = re.compile(r"(ds:.*?)'")
           value_re = re.compile(r"data:([\s\S]*?), sideChannel: {}}\);</")
@@ -184,7 +183,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg7"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg8"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -199,17 +198,66 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
+          # Формируем список изменений и точные рекомендации, что именно скачивать игрокам
+          CHANGES=""
+          DOWNLOAD_GUIDE=""
+
+          if [ "$LAST_TAG" = "none" ]; then
+            CHANGES="🎉 **Первый автоматический релиз готового APK!**"
+            DOWNLOAD_GUIDE="📥 **Что нужно скачать:** установите оба файла — **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**."
+          else
+            LAST_TAG_CORE=$(echo "$LAST_TAG" | sed -E 's/_cfg[0-9]+$//')
+            OLD_GAME=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\1/p')
+            OLD_PLUGIN=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\2/p')
+            OLD_TRANS=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\3/p')
+
+            GAME_CHANGED=false
+            PLUGIN_CHANGED=false
+            TRANS_CHANGED=false
+
+            if [ "$OLD_GAME" != "$CLEAN_GAME" ]; then
+              GAME_CHANGED=true
+              CHANGES="${CHANGES}🎮 **Обновилась игра в Google Play:** \`${OLD_GAME:-?}\` ➔ \`${CLEAN_GAME}\`\n"
+            fi
+            if [ "$OLD_PLUGIN" != "$CLEAN_PLUGIN" ]; then
+              PLUGIN_CHANGED=true
+              CHANGES="${CHANGES}🛠️ **Обновился Gakumas Localify (chinosk6):** \`${OLD_PLUGIN:-?}\` ➔ \`${CLEAN_PLUGIN}\`\n"
+            fi
+            if [ "$OLD_TRANS" != "$CLEAN_TRANS" ]; then
+              TRANS_CHANGED=true
+              CHANGES="${CHANGES}🇷🇺 **Обновился русский перевод:** \`${OLD_TRANS:-?}\` ➔ \`${CLEAN_TRANS}\`\n"
+            fi
+
+            if [ -z "$CHANGES" ]; then
+              CHANGES="🔄 **Принудительная пересборка APK** (обновление конфигурации сборки)\n"
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** рекомендуется установить поверх **ОБА файла** - и **\`Gakumas-Localify-RU.apk\`**, и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**."
+            elif [ "$PLUGIN_CHANGED" = true ] && [ "$GAME_CHANGED" = true ]; then
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** так как обновились **и игра, и Localify**, обязательно скачайте и установите поверх **ОБА файла**: **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**.\n*(Иначе появится ошибка \`Detected plugin version mismatch\`)*."
+            elif [ "$PLUGIN_CHANGED" = true ]; then
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** так как обновился **Localify**, обязательно скачайте и установите поверх **ОБА файла**: **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**.\n*(Иначе появится ошибка \`Detected plugin version mismatch\`)*."
+            elif [ "$GAME_CHANGED" = true ]; then
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** обновилась сама игра (версия Localify не менялась). Достаточно скачать и установить поверх только **\`Gakumas-RU-${CLEAN_GAME}.apk\`**"
+            elif [ "$TRANS_CHANGED" = true ]; then
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** обновился только русский перевод. **Переустанавливать APK игры не обязательно** - просто зайдите в установленный **Localify** и обновите перевод.\n*(Для новых игроков свежий перевод уже вшит в \`Gakumas-RU-${CLEAN_GAME}.apk\`)*."
+            fi
+          fi
+
+          {
+            echo "changes_md<<EOF"
+            printf "%b\n" "$CHANGES"
+            echo "EOF"
+            echo "download_guide_md<<EOF"
+            printf "%b\n" "$DOWNLOAD_GUIDE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Cache Merged Clean Game APK
         if: steps.compare.outputs.should_build == 'true'
         id: cache-game
         uses: actions/cache@v4
         with:
           path: clean_game/gaku_merged.apk
-          # v4 migrates the known-good pre-version-detection cache. The old fixed
-          # key is only a restore candidate; it is never trusted without validation.
           key: gakumas-clean-apk-v4-${{ steps.gplay.outputs.game_ver }}
-          restore-keys: |
-            gakumas-clean-apk-v3-latest
 
       - name: Validate cached merged game APK
         id: validate-game-cache
@@ -258,9 +306,6 @@ jobs:
           APP_SPLITS_DIR="$DOWNLOAD_ROOT/$APP_ID"
           mkdir -p "$DOWNLOAD_ROOT" clean_game
 
-          # Match Kajaqq/gaku-patcher: explicitly request Play split APKs and use
-          # the JP device/locale configuration, instead of silently downloading a
-          # single APK that may omit the ARM64 native-library split.
           ./tools/apkeep -a "$APP_ID" \
             -d google-play \
             -o "locale=jp,timezone=UTC+9,split_apk=1,include_additional_files=true" \
@@ -268,8 +313,6 @@ jobs:
             -t "${{ secrets.GPLAY_AAS_TOKEN }}" \
             "$DOWNLOAD_ROOT"
 
-          # apkeep normally creates <destination>/<package-id>/. Be tolerant of
-          # versions that instead place APKs directly in the destination.
           if [[ ! -d "$APP_SPLITS_DIR" ]] || ! find "$APP_SPLITS_DIR" -type f -name '*.apk' -print -quit 2>/dev/null | grep -q .; then
             if find "$DOWNLOAD_ROOT" -maxdepth 1 -type f -name '*.apk' -print -quit | grep -q .; then
               APP_SPLITS_DIR="$DOWNLOAD_ROOT"
@@ -291,9 +334,6 @@ jobs:
           echo "APKEditor input directory: $APP_SPLITS_DIR"
           printf 'Downloaded APK: %s\n' "${SPLIT_APKS[@]}"
 
-          # Localify's native hook opens libil2cpp.so via
-          # ApplicationInfo.nativeLibraryDir/libil2cpp.so. Both Unity libraries
-          # must therefore survive the merge and be extractable by Android.
           declare -A REQUIRED_GAME_LIBS=(
             [lib/arm64-v8a/libmain.so]=false
             [lib/arm64-v8a/libil2cpp.so]=false
@@ -309,15 +349,10 @@ jobs:
           for required in "${!REQUIRED_GAME_LIBS[@]}"; do
             if [[ "${REQUIRED_GAME_LIBS[$required]}" != true ]]; then
               echo "::error::The downloaded Google Play APK set does not contain $required."
-              echo "This is a source-download/configuration issue; patching cannot restore a missing Unity library."
               exit 1
             fi
           done
 
-          # IMPORTANT: Localify's native initializer expects libil2cpp.so in nativeLibraryDir.
-          # Setting extractNativeLibs=false leaves libraries inside the APK on modern Android,
-          # so the game may launch while the Localify native hook cannot open that filesystem path.
-          # Force extraction-compatible packaging here and again in LSPatch below.
           java -jar tools/APKEditor.jar m \
             -i "$APP_SPLITS_DIR" \
             -o clean_game/gaku_merged.apk \
@@ -366,8 +401,6 @@ jobs:
           git clone --depth 1 https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
           cd localify-source
 
-          # Download the published translation archive. It is expected to contain
-          # local-files/ and version.txt, matching the format consumed by Localify.
           curl -fSL --retry 3 --retry-delay 2 \
             -H "Authorization: Bearer $GH_TOKEN" \
             "$TRANS_URL" -o ../ru_trans.zip
@@ -376,8 +409,6 @@ jobs:
           mkdir -p ../work_ru
           unzip -q ../ru_trans.zip -d ../work_ru
 
-          # Locate the actual payload by its required marker instead of guessing
-          # the ZIP root directory. This prevents copying a nested/empty folder.
           RU_LOCALIZATION_FILE="$(find ../work_ru -type f -path '*/local-files/localization.json' -print -quit)"
           if [[ -z "$RU_LOCALIZATION_FILE" || ! -s "$RU_LOCALIZATION_FILE" ]]; then
             echo "::error::Russian release archive has no non-empty local-files/localization.json"
@@ -394,30 +425,22 @@ jobs:
           TARGET_ASSET_DIR="app/src/main/assets/gakumas-local"
           mkdir -p "$TARGET_ASSET_DIR"
 
-          # Fully replace the old bundled language pack. Do not merge into the
-          # source pack: stale Chinese/English files can otherwise override RU.
           rm -rf "$TARGET_ASSET_DIR/local-files"
           mkdir -p "$TARGET_ASSET_DIR/local-files"
           cp -a "$RU_FILES/." "$TARGET_ASSET_DIR/local-files/"
 
-          # Preserve the translation package's own version, not the combined
-          # game/plugin/release tag. Localify uses this marker for resource sync.
           if [[ -s "$RU_ROOT/version.txt" ]]; then
             cp "$RU_ROOT/version.txt" "$TARGET_ASSET_DIR/version.txt"
           else
             printf '%s\n' "$TRANS_TAG" > "$TARGET_ASSET_DIR/version.txt"
           fi
 
-          # The RU pack provides an Android font. Warn if that expected asset is
-          # absent, but do not fail if the upstream project renames it later.
           if [[ ! -s "$TARGET_ASSET_DIR/local-files/gkanz0-ontMIX.otf" ]]; then
             echo "::warning::RU Android font gkanz0-ontMIX.otf was not found in the latest pack. Checking available fonts:"
             find "$TARGET_ASSET_DIR/local-files" -maxdepth 2 -type f \( -iname '*.otf' -o -iname '*.ttf' \) -print || true
           fi
 
-          # Make initial game configuration compatible with the RU pack.
-          # Upstream translation instructions require lazyInit/Fast Initialization
-          # off and MasterDB localization on. Texture replacement is explicitly off.
+          # Настройки по умолчанию для RU пакета (Fast Initialization / lazyInit = true)
           python3 - <<'PYCONFIG'
           import json
           import re
@@ -437,18 +460,15 @@ jobs:
                   path.write_text(updated, encoding="utf-8")
                   print(f"Set {path}: {key}={str(value).lower()}")
 
-          # These are the per-game hook settings used by the embedded module.
           gakumas_models = list((root / "app/src/main/java").rglob("GakumasConfig.kt"))
           if len(gakumas_models) != 1:
               raise SystemExit(f"Expected one GakumasConfig.kt, found {len(gakumas_models)}")
           gakumas_model = gakumas_models[0]
-          set_bool_property(gakumas_model, "lazyInit", False)
+          set_bool_property(gakumas_model, "lazyInit", True)
           set_bool_property(gakumas_model, "replaceTexture", False)
           set_bool_property(gakumas_model, "useMasterTrans", True)
           set_bool_property(gakumas_model, "enabled", True, required=False)
 
-          # ProgramConfig drives the Resource Settings screen and API updater.
-          # Enable API updates by default and make the RU release API the initial URL.
           program_models = list((root / "app/src/main/java").rglob("ProgramConfig.kt"))
           if len(program_models) != 1:
               raise SystemExit(f"Expected one ProgramConfig.kt, found {len(program_models)}")
@@ -465,7 +485,6 @@ jobs:
           program_model.write_text(program_text, encoding="utf-8")
           print(f"Set {program_model}: useAPIAssetsURL={ru_api}")
 
-          # Also replace the fallback URL used when the saved URL is empty.
           values_dir = root / "app/src/main/res"
           string_resources = list(values_dir.glob("values*/strings.xml"))
           string_re = re.compile(r'(<string\s+name="default_assets_check_api"[^>]*>)(.*?)(</string>)', re.DOTALL)
@@ -480,8 +499,6 @@ jobs:
           if total_replacements == 0:
               raise SystemExit("No default_assets_check_api string resource was found to patch")
 
-          # Some revisions ship an asset-side localizationConfig.json; patch it
-          # when present while preserving every unrelated option in that file.
           config_candidates = list((root / "app/src/main/assets").rglob("localizationConfig.json"))
           for path in config_candidates:
               try:
@@ -489,19 +506,18 @@ jobs:
               except Exception as exc:
                   raise SystemExit(f"Invalid JSON in {path}: {exc}")
               config["enabled"] = True
-              config["lazyInit"] = False
+              config["lazyInit"] = True
               config["replaceTexture"] = False
               config["useMasterTrans"] = True
               path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
               print(f"Updated game config asset: {path}")
 
-          # Validate source defaults and bundled data before Gradle packages them.
           current = program_model.read_text(encoding="utf-8")
           if "useAPIAssets: Boolean = true" not in current or ru_api not in current:
               raise SystemExit("ProgramConfig API defaults did not survive source patch")
           cfg = gakumas_model.read_text(encoding="utf-8")
-          if not re.search(r"var\s+lazyInit\s*:\s*Boolean\s*=\s*false", cfg):
-              raise SystemExit("Fast Initialization/lazyInit is not disabled by default")
+          if not re.search(r"var\s+lazyInit\s*:\s*Boolean\s*=\s*true", cfg):
+              raise SystemExit("Fast Initialization/lazyInit is not enabled by default")
           if not re.search(r"var\s+replaceTexture\s*:\s*Boolean\s*=\s*false", cfg):
               raise SystemExit("Replace Texture is not disabled by default")
           if not re.search(r"var\s+useMasterTrans\s*:\s*Boolean\s*=\s*true", cfg):
@@ -519,7 +535,7 @@ jobs:
           print(f"  translation version: {version.read_text(encoding='utf-8').strip()}")
           print(f"  bundled files: {sum(1 for p in (target_assets / 'local-files').rglob('*') if p.is_file())}")
           print("  checkBuiltInAssets=false, useRemoteAssets=false, useAPIAssets=true, RU API URL set")
-          print("  lazyInit=false, useMasterTrans=true, replaceTexture=false, useAPITextureAssets=false")
+          print("  lazyInit=true, useMasterTrans=true, replaceTexture=false, useAPITextureAssets=false")
           PYCONFIG
 
           chmod +x gradlew
@@ -536,8 +552,6 @@ jobs:
           fi
           echo "Built Localify APK: $BUILT_APK"
 
-          # Assert the final manager/module APK really contains Russian resources
-          # and the settings defaults that will be embedded into the game APK.
           unzip -Z1 "$BUILT_APK" | grep -Fxq 'assets/gakumas-local/local-files/localization.json' || {
             echo "::error::Built Localify APK has no bundled localization.json"
             exit 1
@@ -550,8 +564,6 @@ jobs:
             echo "::error::Bundled translation version.txt is empty"
             exit 1
           }
-          # Confirm the RU API URL made it into the compiled Kotlin bytecode and
-          # any packaged localizationConfig.json still has the intended switches.
           python3 - "$BUILT_APK" "$RU_API_URL" <<'PYAPKVERIFY'
           import sys, zipfile, json
           apk_path, expected_url = sys.argv[1], sys.argv[2]
@@ -562,7 +574,7 @@ jobs:
               config_path = 'assets/gakumas-local/localizationConfig.json'
               if config_path in apk.namelist():
                   config = json.loads(apk.read(config_path).decode('utf-8'))
-                  required = {'enabled': True, 'lazyInit': False, 'replaceTexture': False, 'useMasterTrans': True}
+                  required = {'enabled': True, 'lazyInit': True, 'replaceTexture': False, 'useMasterTrans': True}
                   wrong = {k: (config.get(k), v) for k, v in required.items() if config.get(k) != v}
                   if wrong:
                       raise SystemExit(f'::error::Packaged localizationConfig.json has incorrect settings: {wrong}')
@@ -595,10 +607,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Do not unzip, zip, zipalign, or re-sign LSPatch's output afterwards.
-          # LSPatch can intentionally use overlapping ZIP ranges for origin.apk;
-          # standard ZIP rewrite tools may corrupt that layout. Both referenced
-          # upstream workflows publish the direct LSPatch output.
           rm -rf patched_out
           mkdir -p patched_out
           java -jar tools/lspatch.jar clean_game/gaku_merged.apk \
@@ -621,8 +629,6 @@ jobs:
 
           OUTPUT_APK="Gakumas-RU-${GAME_VER}.apk"
 
-          # Verify the *patched* APK before publishing it. A successful LSPatch exit
-          # alone is insufficient: some patcher builds can skip an invalid module.
           python3 - "$LSPATCHED_APK" Gakumas-Localify-RU.apk <<'PYPATCHVERIFY'
           import hashlib, sys, zipfile
           patched_path, module_path = sys.argv[1:]
@@ -656,10 +662,7 @@ jobs:
               raise SystemExit(f"ERROR: LSPatch produced an invalid APK: {exc}")
           PYPATCHVERIFY
 
-          # Ensure extractNativeLibs=true survived LSPatch so Android materializes
-          # libil2cpp.so under ApplicationInfo.nativeLibraryDir at install time.
           BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
-          # Refuse to publish an APK that Android's signing verifier cannot accept.
           "$BUILD_TOOLS/apksigner" verify --verbose "$LSPATCHED_APK"
           FINAL_BADGING="$("$BUILD_TOOLS/aapt" dump badging "$LSPATCHED_APK")"
           FINAL_PACKAGE="$(sed -n "s/^package: name='\([^']*\)'.*/\1/p" <<< "$FINAL_BADGING" | head -n 1)"
@@ -680,8 +683,6 @@ jobs:
           fi
           echo "Verified android:extractNativeLibs=true in patched game APK."
 
-          # Publish LSPatch's APK byte-for-byte. Do not re-zip, align or re-sign it
-          # afterwards because LSPatch may use overlapping ZIP ranges for origin.apk.
           cp -- "$LSPATCHED_APK" "$OUTPUT_APK"
           echo "Published artifact candidate: $OUTPUT_APK"
           ls -lh "$LSPATCHED_APK" "$OUTPUT_APK"
@@ -692,16 +693,20 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.compare.outputs.combined_tag }}
-          name: "Gakumas RU (${{ steps.gplay.outputs.game_ver }} | RU ${{ steps.check_upstreams.outputs.trans_tag }})"
+          name: "Gakumas RU (${{ steps.gplay.outputs.game_ver }} | Localify ${{ steps.check_upstreams.outputs.plugin_tag }} | RU ${{ steps.check_upstreams.outputs.trans_tag }})"
           body: |
             ### Готовый APK Gakuen Idolmaster с вшитым русским переводом и Localify
             * **Версия игры (Google Play):** `${{ steps.gplay.outputs.game_ver }}`
-            * **Версия перевода (Gakumas-Translation-Data-RU):** [`${{ steps.check_upstreams.outputs.trans_tag }}`](${{ steps.check_upstreams.outputs.trans_html_url }})
             * **Версия плагина (chinosk6 Localify):** [`${{ steps.check_upstreams.outputs.plugin_tag }}`](${{ steps.check_upstreams.outputs.plugin_html_url }})
+            * **Версия перевода (Gakumas-Translation-Data-RU):** [`${{ steps.check_upstreams.outputs.trans_tag }}`](${{ steps.check_upstreams.outputs.trans_html_url }})
 
-            #### Установка:
-            1. Установите **`Gakumas-Localify-RU.apk`** для ручного управления Localify и проверки/обновления русского пакета через API.
-            2. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет уже встроен.
+            #### Что изменилось в этом релизе:
+            ${{ steps.compare.outputs.changes_md }}
+            ${{ steps.compare.outputs.download_guide_md }}
+
+            #### Установка с нуля (первый раз):
+            1. Установите **`Gakumas-Localify-RU.apk`** для управления настройками Localify и обновления русского пакета через API.
+            2. Установите **`Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk`**. Русский пакет перевода уже встроен по умолчанию.
 
           files: |
             Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk
@@ -713,37 +718,10 @@ jobs:
         if: steps.compare.outputs.should_build == 'true'
         env:
           WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          CHANGES_MD: ${{ steps.compare.outputs.changes_md }}
+          DOWNLOAD_GUIDE_MD: ${{ steps.compare.outputs.download_guide_md }}
         run: |
-          LAST_TAG="${{ steps.compare.outputs.last_tag }}"
-          CUR_GAME="${{ steps.compare.outputs.clean_game }}"
-          CUR_PLUGIN="${{ steps.compare.outputs.clean_plugin }}"
-          CUR_TRANS="${{ steps.compare.outputs.clean_trans }}"
-
-          CHANGES=""
-          if [ "$LAST_TAG" = "none" ]; then
-            CHANGES="🎉 **Первый автоматический релиз готового APK!**"
-          else
-            # Remove the workflow/config revision suffix before comparing component versions.
-            LAST_TAG_CORE=$(echo "$LAST_TAG" | sed -E 's/_cfg[0-9]+$//')
-            OLD_GAME=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\1/p')
-            OLD_PLUGIN=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\2/p')
-            OLD_TRANS=$(echo "$LAST_TAG_CORE" | sed -n 's/^g\(.*\)_p\(.*\)_ru\(.*\)$/\3/p')
-
-            if [ "$OLD_GAME" != "$CUR_GAME" ]; then
-              CHANGES="${CHANGES}🎮 **Обновилась игра в Google Play:** \`${OLD_GAME:-?}\` ➔ \`${CUR_GAME}\`\n"
-            fi
-            if [ "$OLD_PLUGIN" != "$CUR_PLUGIN" ]; then
-              CHANGES="${CHANGES}🛠️ **Обновился Gakumas Localify (chinosk6):** \`${OLD_PLUGIN:-?}\` ➔ \`${CUR_PLUGIN}\`\n"
-            fi
-            if [ "$OLD_TRANS" != "$CUR_TRANS" ]; then
-              CHANGES="${CHANGES}🇷🇺 **Обновился русский перевод:** \`${OLD_TRANS:-?}\` ➔ \`${CUR_TRANS}\`\n\n**Вам не обязательно переустанавливать игру. Зайдите в Localify и обновите перевод.**\n"
-            fi
-            if [ -z "$CHANGES" ]; then
-              CHANGES="🔄 **Принудительная пересборка APK** (версии компонентов не менялись)"
-            fi
-          fi
-
-          CHANGES_FORMATTED=$(printf "%b" "$CHANGES")
+          FULL_DESCRIPTION=$(printf "%s\n\n%s" "$CHANGES_MD" "$DOWNLOAD_GUIDE_MD")
 
           RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ steps.compare.outputs.combined_tag }}"
           GAME_DL="https://github.com/${{ github.repository }}/releases/download/${{ steps.compare.outputs.combined_tag }}/Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
@@ -754,7 +732,7 @@ jobs:
           jq -n \
             --arg title "Доступно обновление Gakumas RU (${{ steps.gplay.outputs.game_ver }})" \
             --arg url "$RELEASE_URL" \
-            --arg changes "$CHANGES_FORMATTED" \
+            --arg changes "$FULL_DESCRIPTION" \
             --arg game_ver "${{ steps.gplay.outputs.game_ver }}" \
             --arg trans_ver "${{ steps.check_upstreams.outputs.trans_tag }}" \
             --arg plugin_ver "${{ steps.check_upstreams.outputs.plugin_tag }}" \
