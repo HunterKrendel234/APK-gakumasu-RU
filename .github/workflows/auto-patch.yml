@@ -438,14 +438,13 @@ jobs:
             echo "::warning::No .otf/.ttf font was found in the latest RU translation pack."
           fi
 
-          # Настройки по умолчанию для RU пакета, перевод интерфейса, ошибок GakumasHookMain.kt и добавление автора
+          # Настройки по умолчанию для RU пакета, перевод интерфейса и ошибок GakumasHookMain.kt
           python3 - <<'PYCONFIG'
           import json
           import re
           from pathlib import Path
 
           ru_api = "https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest"
-          ru_trans_repo = "https://github.com/HunterKrendel234/Gakumas-Translation-Data-RU"
           root = Path.cwd()
           target_assets = root / "app/src/main/assets/gakumas-local"
 
@@ -561,8 +560,8 @@ jobs:
               "hook_cfg_failed_msg",
               "Не удалось загрузить настройки из плагина, будут использованы настройки по умолчанию.\\n"
               "Возможно, вы не установили приложение Gakumas Localify RU отдельно или запретили игре запуск других приложений.\\n"
-              "Если приложение плагина не установлено — пожалуйста, скачайте и установите его.\\n"
-              "Если оно уже установлено, но вы видите эту ошибку — разрешите игре запуск других приложений в настройках системы."
+              "Если приложение плагина не установлено - пожалуйста, скачайте и установите его.\\n"
+              "Если оно уже установлено, но вы видите эту ошибку - разрешите игре запуск других приложений в настройках системы."
           )
           h_info_btn = get_hook_str("hook_info_btn", "Инфо")
           h_dl_btn = get_hook_str("hook_dl_btn", "Скачать")
@@ -595,57 +594,7 @@ jobs:
           hook_path.write_text(hook_text, encoding="utf-8")
           print(f"Successfully patched all English errors in GakumasHookMain.kt (mismatch={m_cnt}, cfg_failed={c_cnt})")
 
-          # 4. Добавляем HunterKrendel234 в about_contributors_en.json (никого не удаляя!)
-          for contrib_path in (root / "app/src/main/assets").glob("about_contributors*.json"):
-              try:
-                  data = json.loads(contrib_path.read_text(encoding="utf-8"))
-              except Exception as exc:
-                  print(f"Skipping {contrib_path}: {exc}")
-                  continue
-
-              groups = data.get("main_contributors")
-              if isinstance(groups, list):
-                  for group in groups:
-                      if not isinstance(group, dict):
-                          continue
-                      gname = str(group.get("group_name", ""))
-                      members = group.get("members")
-                      if not isinstance(members, list):
-                          continue
-
-                      members[:] = [m for m in members if isinstance(m, dict) and m.get("name") != "HunterKrendel234"]
-
-                      if "trans" in gname.lower() or "译" in gname or "翻" in gname:
-                          # В группу перевода игры — в самый верх
-                          members.insert(0, {
-                              "name": "HunterKrendel234",
-                              "avatar": "https://github.com/HunterKrendel234.png",
-                              "role": "Перевод игры на русский",
-                              "links": [
-                                  {
-                                      "name": "GitHub",
-                                      "link": ru_trans_repo
-                                  }
-                              ]
-                          })
-                      elif "plugin" in gname.lower() or "插" in gname:
-                          # В группу плагина — только перевод плагина
-                          members.append({
-                              "name": "HunterKrendel234",
-                              "avatar": "https://github.com/HunterKrendel234.png",
-                              "role": "Перевод плагина на русский",
-                              "links": [
-                                  {
-                                      "name": "GitHub",
-                                      "link": "https://github.com/HunterKrendel234"
-                                  }
-                              ]
-                          })
-
-                  contrib_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-                  print(f"Updated contributors (kept all existing members, added HunterKrendel234) in {contrib_path.name}")
-
-          # 5. Патчим localizationConfig.json в ассетах (если присутствует)
+          # 4. Патчим localizationConfig.json в ассетах (если присутствует)
           config_candidates = list((root / "app/src/main/assets").rglob("localizationConfig.json"))
           for path in config_candidates:
               try:
@@ -659,7 +608,7 @@ jobs:
               path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
               print(f"Updated game config asset: {path}")
 
-          # 6. Финальная валидация перед компиляцией
+          # 5. Финальная валидация перед компиляцией
           current = program_model.read_text(encoding="utf-8")
           if "useAPIAssets: Boolean = true" not in current or ru_api not in current:
               raise SystemExit("ProgramConfig API defaults did not survive source patch")

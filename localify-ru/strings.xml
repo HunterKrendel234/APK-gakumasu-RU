@@ -1,7 +1,7 @@
 <resources>
     <string name="app_name">Gakumas Localify RU</string>
     <string name="gakumas_localify">Gakumas Localify RU</string>
-    <string name="enable_plugin">Включить плагин (требуется перезапуск игры)</string>
+    <string name="enable_plugin">Вкл. плагин (требуется перезапуск игры)</string>
     <string name="replace_font">Заменять шрифт</string>
     <string name="replace_texture">Заменять текстуры</string>
     <string name="lazy_init">Быстрая инициализация (Lazy loading)</string>
@@ -13,13 +13,13 @@
     <string name="liveUseCustomeDress">Свой персонаж и костюм в Live</string>
     <string name="live_costume_head_id">ID головы/прически в Live (напр. costume_head_hski-cstm-0002)</string>
     <string name="live_custome_dress_id">ID костюма в Live (напр. hski-cstm-0002)</string>
-    <string name="useCustomeGraphicSettings">Использовать свои настройки графики</string>
+    <string name="useCustomeGraphicSettings">Вкл. свои настройки графики</string>
     <string name="renderscale">Масштаб рендера (0.5/0.59/0.67/0.77/1.0)</string>
     <string name="text_hook_test_mode">Тестовый режим перехвата текста</string>
-    <string name="useMasterDBTrans">Включить перевод базы данных (MasterDB)</string>
+    <string name="useMasterDBTrans">Вкл. перевод базы данных (MasterDB)</string>
     <string name="export_text">Экспортировать текст</string>
     <string name="dump_runtime_texture">Дамп текстур во время игры</string>
-    <string name="force_export_resource">Принудительно обновить встроенные ресурсы</string>
+    <string name="force_export_resource">Принудительно обновить встроенные рес.</string>
     <string name="login_as_ios">Входить как устройство iOS</string>
     <string name="max_high">Ультра</string>
     <string name="very_high">Очень высокое</string>
@@ -38,7 +38,7 @@
     <string name="pendulumrange">Амплитуда маятника (Pendulum Range)</string>
     <string name="average">Сглаживание (Average)</string>
     <string name="rootweight">Вес основания (Root Weight)</string>
-    <string name="uselimit_0_1">Множитель лимита (0 - без ограничений)</string>
+    <string name="uselimit_0_1">Множитель лимита (0 - безлимит)</string>
     <string name="usearmcorrection">Коррекция при движении рук</string>
     <string name="isdirty">Принудительное обновление (IsDirty)</string>
     <string name="usescale">Изменять размер груди</string>
@@ -70,17 +70,17 @@
     <string name="contributors">Авторы и участники</string>
     <string name="translation_repository">Репозиторий перевода</string>
     <string name="resource_settings">Настройки ресурсов перевода</string>
-    <string name="check_built_in_resource">Проверять обновления встроенных ресурсов</string>
-    <string name="delete_plugin_resource">Удалить скачанные ресурсы перевода</string>
-    <string name="use_remote_zip_resource">Использовать ZIP-архив по прямой ссылке</string>
-    <string name="resource_url">Прямая ссылка на ZIP-архив</string>
+    <string name="check_built_in_resource">Проверять обновления встроенных ресур.</string>
+    <string name="delete_plugin_resource">Удалить ресурсы перевода</string>
+    <string name="use_remote_zip_resource">Использовать ZIP-архив по ссылке</string>
+    <string name="resource_url">Ссылка на ZIP-архив</string>
     <string name="download">Скачать</string>
     <string name="invalid_zip_file">Некорректный файл</string>
     <string name="invalid_zip_file_warn">Этот файл не является корректным ZIP-архивом ресурсов перевода.</string>
     <string name="cancel">Отмена</string>
     <string name="ok">ОК</string>
     <string name="downloaded_resource_version">Установленная версия</string>
-    <string name="del_remote_after_update">Удалять кэш архива после обновления</string>
+    <string name="del_remote_after_update">Удалять кэш после обновления</string>
     <string name="warning">Внимание</string>
     <string name="install">Установить</string>
     <string name="installing">Установка...</string>
