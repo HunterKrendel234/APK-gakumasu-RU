@@ -7,7 +7,7 @@
     <string name="lazy_init">Быстрая инициализация (Lazy loading)</string>
     <string name="enable_free_camera">Включить свободную камеру</string>
     <string name="start_game">Запустить игру / Применить настройки</string>
-    <string name="setFpsTitle">Макс. FPS (0 — по умолчанию)</string>
+    <string name="setFpsTitle">Макс. FPS (0 - по умолчанию)</string>
     <string name="unlockAllLive">Разблокировать все песни в Live</string>
     <string name="unlockAllLiveCostume">Разблокировать все костюмы в Live</string>
     <string name="liveUseCustomeDress">Свой персонаж и костюм в Live</string>
@@ -38,7 +38,7 @@
     <string name="pendulumrange">Амплитуда маятника (Pendulum Range)</string>
     <string name="average">Сглаживание (Average)</string>
     <string name="rootweight">Вес основания (Root Weight)</string>
-    <string name="uselimit_0_1">Множитель лимита (0 — без ограничений)</string>
+    <string name="uselimit_0_1">Множитель лимита (0 - без ограничений)</string>
     <string name="usearmcorrection">Коррекция при движении рук</string>
     <string name="isdirty">Принудительное обновление (IsDirty)</string>
     <string name="usescale">Изменять размер груди</string>
@@ -53,7 +53,7 @@
     <string name="basic_settings">Основные настройки</string>
     <string name="graphic_settings">Настройки графики</string>
     <string name="camera_settings">Настройки камеры</string>
-    <string name="test_mode_live">Тестовый режим — LIVE</string>
+    <string name="test_mode_live">Тестовый режим - LIVE</string>
     <string name="debug_settings">Настройки отладки</string>
     <string name="breast_param">Параметры физики груди</string>
     <string name="about">О плагине</string>
@@ -61,7 +61,7 @@
     <string name="advanced_settings">Дополнительно</string>
     <string name="about_warn_title">ВНИМАНИЕ</string>
     <string name="about_warn_p1">Этот плагин предназначен только для ознакомления и изучения.</string>
-    <string name="about_warn_p2">Использование сторонних плагинов нарушает условия использования игры — вы действуете на свой страх и риск.</string>
+    <string name="about_warn_p2">Использование сторонних плагинов нарушает условия использования игры - вы действуете на свой страх и риск.</string>
     <string name="about_about_title">О плагине</string>
     <string name="about_about_p1">Этот плагин полностью бесплатен. Если вы заплатили за него, пожалуйста, пожалуйтесь на продавца.</string>
     <string name="about_about_p2">Группа плагина в QQ: 975854705</string>
@@ -112,4 +112,17 @@
     <string name="about_contributors_asset_file">about_contributors_en.json</string>
     <string name="default_assets_check_api">https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest</string>
     <string name="default_texture_assets_check_api">https://texture.gakumas.cn/api/gkms_texture_data</string>
+
+    <!-- Перевод внутриигровых ошибок из GakumasHookMain.kt -->
+    <string name="hook_lib_loaded">Библиотека lib$nativeLibName.so загружена.</string>
+    <string name="hook_lib_failed">Не удалось загрузить библиотеку lib$nativeLibName.so.</string>
+    <string name="hook_warning_title">Внимание</string>
+    <string name="hook_ok_btn">ОК</string>
+    <string name="hook_exit_btn">Выход</string>
+    <string name="hook_version_mismatch_msg">Обнаружено несовпадение версий плагина!\nВстроенная в игру версия: $buildVersionName\nВерсия приложения Localify: $readVersion\n\nЭто происходит, когда после выхода обновления вы установили только один из APK-файлов. Пожалуйста, скачайте и установите поверх актуальные версии обоих файлов (игры и Gakumas Localify RU).</string>
+    <string name="hook_error_info_title">Подробности ошибки</string>
+    <string name="hook_cfg_failed_title">Ошибка чтения настроек</string>
+    <string name="hook_cfg_failed_msg">Не удалось загрузить настройки из плагина, будут использованы настройки по умолчанию.\nВозможно, вы не установили приложение Gakumas Localify RU отдельно или запретили игре запуск других приложений.\nЕсли приложение плагина не установлено - пожалуйста, скачайте и установите его.\nЕсли оно уже установлено, но вы видите эту ошибку - разрешите игре запуск других приложений в настройках системы.</string>
+    <string name="hook_info_btn">Инфо</string>
+    <string name="hook_dl_btn">Скачать</string>
 </resources>

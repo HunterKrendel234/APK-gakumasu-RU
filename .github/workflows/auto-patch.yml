@@ -34,17 +34,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 1. Получаем реальную версию плагина напрямую из app/build.gradle в ветке main
-          # (chinosk6 обновляет versionName в main без создания релизов в Gitea, где релиз застрял на v3.5.0)
-          GRADLE_CONTENT=$(curl -fsSL "https://git.chinosk6.cn/chinosk/gkms-local/raw/branch/main/app/build.gradle" 2>/dev/null || true)
-          PLUGIN_TAG=$(echo "$GRADLE_CONTENT" | sed -n 's/.*versionName[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+          # 1. Клонируем исходники плагина через Git (обходит блокировку веб-ссылок Gitea)
+          # и читаем реальную версию напрямую из localify-source/app/build.gradle
+          rm -rf localify-source
+          git clone --depth 1 https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
+          PLUGIN_TAG=$(sed -n 's/.*versionName[[:space:]]*"\([^"]*\)".*/\1/p' localify-source/app/build.gradle | head -n 1)
 
           if [ -z "$PLUGIN_TAG" ] || [ "$PLUGIN_TAG" = "null" ]; then
-            PLUGIN_INFO=$(curl -s https://git.chinosk6.cn/api/v1/repos/chinosk/gkms-local/releases/latest 2>/dev/null)
-            PLUGIN_TAG=$(echo "$PLUGIN_INFO" | jq -r '.tag_name // empty')
-          fi
-          if [ -z "$PLUGIN_TAG" ] || [ "$PLUGIN_TAG" = "null" ]; then
-            PLUGIN_TAG=$(curl -s https://git.chinosk6.cn/api/v1/repos/chinosk/gkms-local/commits?limit=1 2>/dev/null | jq -r '.[0].sha[0:7]' // "v3.6.1")
+            PLUGIN_TAG=$(git -C localify-source rev-parse --short HEAD || echo "v3.6.1")
           fi
           PLUGIN_HTML_URL="https://git.chinosk6.cn/chinosk/gkms-local"
 
@@ -183,7 +180,7 @@ jobs:
           CLEAN_PLUGIN=$(echo "${{ steps.check_upstreams.outputs.plugin_tag }}" | tr -cd 'a-zA-Z0-9._-')
           CLEAN_TRANS=$(echo "${{ steps.check_upstreams.outputs.trans_tag }}" | tr -cd 'a-zA-Z0-9._-')
 
-          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg8"
+          COMBINED_TAG="g${CLEAN_GAME}_p${CLEAN_PLUGIN}_ru${CLEAN_TRANS}_cfg9"
           echo "combined_tag=$COMBINED_TAG" >> $GITHUB_OUTPUT
           echo "clean_game=$CLEAN_GAME" >> $GITHUB_OUTPUT
           echo "clean_plugin=$CLEAN_PLUGIN" >> $GITHUB_OUTPUT
@@ -232,9 +229,9 @@ jobs:
               CHANGES="🔄 **Принудительная пересборка APK** (обновление конфигурации сборки)\n"
               DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** рекомендуется установить поверх **ОБА файла** - и **\`Gakumas-Localify-RU.apk\`**, и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**."
             elif [ "$PLUGIN_CHANGED" = true ] && [ "$GAME_CHANGED" = true ]; then
-              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** так как обновились **и игра, и Localify**, обязательно скачайте и установите поверх **ОБА файла**: **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**.\n*(Иначе появится ошибка \`Detected plugin version mismatch\`)*."
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** так как обновились **и игра, и Localify**, обязательно скачайте и установите поверх **ОБА файла**: **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**.\n*(Иначе появится ошибка \`Обнаружено несовпадение версий плагина!\`)*."
             elif [ "$PLUGIN_CHANGED" = true ]; then
-              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** так как обновился **Localify**, обязательно скачайте и установите поверх **ОБА файла**: **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**.\n*(Иначе появится ошибка \`Detected plugin version mismatch\`)*."
+              DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** так как обновился **Localify**, обязательно скачайте и установите поверх **ОБА файла**: **\`Gakumas-Localify-RU.apk\`** и **\`Gakumas-RU-${CLEAN_GAME}.apk\`**.\n*(Иначе появится ошибка \`Обнаружено несовпадение версий плагина!\`)*."
             elif [ "$GAME_CHANGED" = true ]; then
               DOWNLOAD_GUIDE="📥 **Что нужно скачать при обновлении:** обновилась сама игра (версия Localify не менялась). Достаточно скачать и установить поверх только **\`Gakumas-RU-${CLEAN_GAME}.apk\`**"
             elif [ "$TRANS_CHANGED" = true ]; then
@@ -398,7 +395,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          git clone --depth 1 https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
+          if [[ ! -d localify-source ]]; then
+            git clone --depth 1 https://git.chinosk6.cn/chinosk/gkms-local.git localify-source
+          fi
           cd localify-source
 
           curl -fSL --retry 3 --retry-delay 2 \
@@ -440,13 +439,14 @@ jobs:
             find "$TARGET_ASSET_DIR/local-files" -maxdepth 2 -type f \( -iname '*.otf' -o -iname '*.ttf' \) -print || true
           fi
 
-          # Настройки по умолчанию для RU пакета (Fast Initialization / lazyInit = true)
+          # Настройки по умолчанию для RU пакета, перевод интерфейса, ошибок GakumasHookMain.kt и добавление автора
           python3 - <<'PYCONFIG'
           import json
           import re
           from pathlib import Path
 
           ru_api = "https://api.github.com/repos/HunterKrendel234/Gakumas-Translation-Data-RU/releases/latest"
+          ru_trans_repo = "https://github.com/HunterKrendel234/Gakumas-Translation-Data-RU"
           root = Path.cwd()
           target_assets = root / "app/src/main/assets/gakumas-local"
 
@@ -460,6 +460,7 @@ jobs:
                   path.write_text(updated, encoding="utf-8")
                   print(f"Set {path}: {key}={str(value).lower()}")
 
+          # 1. Настройки игры и менеджера по умолчанию (lazyInit = true)
           gakumas_models = list((root / "app/src/main/java").rglob("GakumasConfig.kt"))
           if len(gakumas_models) != 1:
               raise SystemExit(f"Expected one GakumasConfig.kt, found {len(gakumas_models)}")
@@ -499,6 +500,151 @@ jobs:
           if total_replacements == 0:
               raise SystemExit("No default_assets_check_api string resource was found to patch")
 
+          # 2. Читаем наш файл перевода localify-ru/strings.xml (или strings.xml в корне репо)
+          custom_strings_file = root.parent / "localify-ru" / "strings.xml"
+          if not custom_strings_file.is_file() and (root.parent / "strings.xml").is_file():
+              custom_strings_file = root.parent / "strings.xml"
+
+          ru_dict = {}
+          if custom_strings_file.is_file():
+              ru_xml = custom_strings_file.read_text(encoding="utf-8")
+              item_re = re.compile(r'(<string\s+name="([^"]+)"[^>]*>)(.*?)(</string>)', re.DOTALL)
+              ru_dict = {m.group(2): m.group(3) for m in item_re.finditer(ru_xml)}
+              ru_dict.pop("default_assets_check_api", None)
+
+              default_strings_path = values_dir / "values" / "strings.xml"
+              if default_strings_path.is_file() and ru_dict:
+                  orig_xml = default_strings_path.read_text(encoding="utf-8")
+                  replaced_count = 0
+                  def replace_str(m):
+                      nonlocal replaced_count
+                      key = m.group(2)
+                      if key in ru_dict and not key.startswith("hook_"):
+                          replaced_count += 1
+                          return m.group(1) + ru_dict[key] + m.group(4)
+                      return m.group(0)
+
+                  patched_xml = item_re.sub(replace_str, orig_xml)
+                  default_strings_path.write_text(patched_xml, encoding="utf-8")
+                  ru_values_dir = values_dir / "values-ru"
+                  ru_values_dir.mkdir(parents=True, exist_ok=True)
+                  (ru_values_dir / "strings.xml").write_text(patched_xml, encoding="utf-8")
+                  print(f"Applied {replaced_count} Russian UI strings from {custom_strings_file}")
+          else:
+              print("No localify-ru/strings.xml found in repo, keeping original UI strings")
+
+          # 3. Подменяем ошибки и диалоги в GakumasHookMain.kt значениями из файла перевода
+          hook_files = list((root / "app/src/main/java").rglob("GakumasHookMain.kt"))
+          if not hook_files:
+              raise SystemExit("GakumasHookMain.kt not found")
+          hook_path = hook_files[0]
+          hook_text = hook_path.read_text(encoding="utf-8")
+
+          h_lib_loaded = ru_dict.get("hook_lib_loaded", "Библиотека lib$nativeLibName.so загружена.")
+          h_lib_failed = ru_dict.get("hook_lib_failed", "Не удалось загрузить библиотеку lib$nativeLibName.so.")
+          h_warn_title = ru_dict.get("hook_warning_title", "Внимание")
+          h_ok_btn = ru_dict.get("hook_ok_btn", "ОК")
+          h_exit_btn = ru_dict.get("hook_exit_btn", "Выход")
+          h_mismatch_msg = ru_dict.get(
+              "hook_version_mismatch_msg",
+              "Обнаружено несовпадение версий плагина!\\n"
+              "Встроенная в игру версия: $buildVersionName\\n"
+              "Версия приложения Localify: $readVersion\\n\\n"
+              "Это происходит, когда после выхода обновления вы установили только один из APK-файлов. "
+              "Пожалуйста, скачайте и установите поверх актуальные версии обоих файлов (игры и Gakumas Localify RU)."
+          )
+          h_err_info_title = ru_dict.get("hook_error_info_title", "Подробности ошибки")
+          h_cfg_title = ru_dict.get("hook_cfg_failed_title", "Ошибка чтения настроек")
+          h_cfg_msg = ru_dict.get(
+              "hook_cfg_failed_msg",
+              "Не удалось загрузить настройки из плагина, будут использованы настройки по умолчанию.\\n"
+              "Возможно, вы не установили приложение Gakumas Localify RU отдельно или запретили игре запуск других приложений.\\n"
+              "Если приложение плагина не установлено — пожалуйста, скачайте и установите его.\\n"
+              "Если оно уже установлено, но вы видите эту ошибку — разрешите игре запуск других приложений в настройках системы."
+          )
+          h_info_btn = ru_dict.get("hook_info_btn", "Инфо")
+          h_dl_btn = ru_dict.get("hook_dl_btn", "Скачать")
+
+          hook_text = hook_text.replace('showToast("lib$nativeLibName.so loaded.")', f'showToast("{h_lib_loaded}")')
+          hook_text = hook_text.replace('showToast("Load native library lib$nativeLibName.so failed.")', f'showToast("{h_lib_failed}")')
+          hook_text = hook_text.replace('builder.setTitle("Warning")', f'builder.setTitle("{h_warn_title}")')
+          hook_text = hook_text.replace('builder.setPositiveButton("OK")', f'builder.setPositiveButton("{h_ok_btn}")')
+          hook_text = hook_text.replace('builder.setNegativeButton("Exit")', f'builder.setNegativeButton("{h_exit_btn}")')
+          hook_text = hook_text.replace('infoBuilder.setTitle("Error Info")', f'infoBuilder.setTitle("{h_err_info_title}")')
+          hook_text = hook_text.replace('"title" to "Get Config Failed"', f'"title" to "{h_cfg_title}"')
+          hook_text = hook_text.replace('"infoButton" to "Info"', f'"infoButton" to "{h_info_btn}"')
+          hook_text = hook_text.replace('"dlButton" to "Download"', f'"dlButton" to "{h_dl_btn}"')
+          hook_text = hook_text.replace('"okButton" to "OK"', f'"okButton" to "{h_ok_btn}"')
+
+          # Замена текста ошибки несовпадения версий в checkPluginVersion
+          mismatch_re = re.compile(r'else\s*->\s*"Обнаружено несовпадение версий плагина![^"]*"')
+          hook_text, m_cnt = mismatch_re.subn(lambda _: f'else -> "{h_mismatch_msg}"', hook_text)
+
+          # Замена многострочного текста ошибки чтения конфига в showGetConfigFailed
+          cfg_msg_re = re.compile(
+              r'"message"\s*to\s*"Configuration loading failed[\s\S]*?launch other applications\."\s*,',
+              re.MULTILINE
+          )
+          hook_text, c_cnt = cfg_msg_re.subn(lambda _: f'"message" to "{h_cfg_msg}",', hook_text)
+
+          if m_cnt == 0 or c_cnt == 0:
+              raise SystemExit(f"Failed to patch GakumasHookMain.kt error dialogs (mismatch={m_cnt}, cfg_failed={c_cnt})")
+
+          hook_path.write_text(hook_text, encoding="utf-8")
+          print(f"Successfully patched all English errors in GakumasHookMain.kt (mismatch={m_cnt}, cfg_failed={c_cnt})")
+
+          # 4. Добавляем HunterKrendel234 в about_contributors_en.json (никого не удаляя!)
+          for contrib_path in (root / "app/src/main/assets").glob("about_contributors*.json"):
+              try:
+                  data = json.loads(contrib_path.read_text(encoding="utf-8"))
+              except Exception as exc:
+                  print(f"Skipping {contrib_path}: {exc}")
+                  continue
+
+              groups = data.get("main_contributors")
+              if isinstance(groups, list):
+                  for group in groups:
+                      if not isinstance(group, dict):
+                          continue
+                      gname = str(group.get("group_name", ""))
+                      members = group.get("members")
+                      if not isinstance(members, list):
+                          continue
+
+                      # Убираем дубликаты, если скрипт запускался повторно
+                      members[:] = [m for m in members if isinstance(m, dict) and m.get("name") != "HunterKrendel234"]
+
+                      if "trans" in gname.lower() or "译" in gname or "翻" in gname:
+                          # В группу перевода игры — в самый верх
+                          members.insert(0, {
+                              "name": "HunterKrendel234",
+                              "avatar": "https://github.com/HunterKrendel234.png",
+                              "role": "Перевод игры на русский",
+                              "links": [
+                                  {
+                                      "name": "GitHub",
+                                      "link": ru_trans_repo
+                                  }
+                              ]
+                          })
+                      elif "plugin" in gname.lower() or "插" in gname:
+                          # В группу плагина — только перевод плагина
+                          members.append({
+                              "name": "HunterKrendel234",
+                              "avatar": "https://github.com/HunterKrendel234.png",
+                              "role": "Перевод плагина на русский",
+                              "links": [
+                                  {
+                                      "name": "GitHub",
+                                      "link": "https://github.com/HunterKrendel234"
+                                  }
+                              ]
+                          })
+
+                  contrib_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                  print(f"Updated contributors (kept all existing members, added HunterKrendel234) in {contrib_path.name}")
+
+          # 5. Патчим localizationConfig.json в ассетах (если присутствует)
           config_candidates = list((root / "app/src/main/assets").rglob("localizationConfig.json"))
           for path in config_candidates:
               try:
@@ -512,6 +658,7 @@ jobs:
               path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
               print(f"Updated game config asset: {path}")
 
+          # 6. Финальная валидация перед компиляцией
           current = program_model.read_text(encoding="utf-8")
           if "useAPIAssets: Boolean = true" not in current or ru_api not in current:
               raise SystemExit("ProgramConfig API defaults did not survive source patch")
@@ -534,8 +681,6 @@ jobs:
           print("Verified RU assets and Localify defaults:")
           print(f"  translation version: {version.read_text(encoding='utf-8').strip()}")
           print(f"  bundled files: {sum(1 for p in (target_assets / 'local-files').rglob('*') if p.is_file())}")
-          print("  checkBuiltInAssets=false, useRemoteAssets=false, useAPIAssets=true, RU API URL set")
-          print("  lazyInit=true, useMasterTrans=true, replaceTexture=false, useAPITextureAssets=false")
           PYCONFIG
 
           chmod +x gradlew
