@@ -579,7 +579,7 @@ jobs:
           hook_text = hook_text.replace('"okButton" to "OK"', f'"okButton" to "{h_ok_btn}"')
 
           # Замена текста ошибки несовпадения версий в checkPluginVersion
-          mismatch_re = re.compile(r'else\s*->\s*"Обнаружено несовпадение версий плагина![^"]*"')
+          mismatch_re = re.compile(r'else\s*->\s*"[^"]*\$buildVersionName[^"]*\$readVersion[^"]*"')
           hook_text, m_cnt = mismatch_re.subn(lambda _: f'else -> "{h_mismatch_msg}"', hook_text)
 
           # Замена многострочного текста ошибки чтения конфига в showGetConfigFailed
