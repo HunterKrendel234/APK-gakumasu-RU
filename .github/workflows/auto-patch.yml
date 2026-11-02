@@ -434,9 +434,8 @@ jobs:
             printf '%s\n' "$TRANS_TAG" > "$TARGET_ASSET_DIR/version.txt"
           fi
 
-          if [[ ! -s "$TARGET_ASSET_DIR/local-files/gkanz0-ontMIX.otf" ]]; then
-            echo "::warning::RU Android font gkanz0-ontMIX.otf was not found in the latest pack. Checking available fonts:"
-            find "$TARGET_ASSET_DIR/local-files" -maxdepth 2 -type f \( -iname '*.otf' -o -iname '*.ttf' \) -print || true
+          if ! find "$TARGET_ASSET_DIR/local-files" -maxdepth 2 -type f \( -iname '*.otf' -o -iname '*.ttf' \) -print -quit | grep -q .; then
+            echo "::warning::No .otf/.ttf font was found in the latest RU translation pack."
           fi
 
           # Настройки по умолчанию для RU пакета, перевод интерфейса, ошибок GakumasHookMain.kt и добавление автора
@@ -515,12 +514,11 @@ jobs:
               default_strings_path = values_dir / "values" / "strings.xml"
               if default_strings_path.is_file() and ru_dict:
                   orig_xml = default_strings_path.read_text(encoding="utf-8")
-                  replaced_count = 0
+                  replaced_keys = []
                   def replace_str(m):
-                      nonlocal replaced_count
                       key = m.group(2)
                       if key in ru_dict and not key.startswith("hook_"):
-                          replaced_count += 1
+                          replaced_keys.append(key)
                           return m.group(1) + ru_dict[key] + m.group(4)
                       return m.group(0)
 
@@ -529,7 +527,7 @@ jobs:
                   ru_values_dir = values_dir / "values-ru"
                   ru_values_dir.mkdir(parents=True, exist_ok=True)
                   (ru_values_dir / "strings.xml").write_text(patched_xml, encoding="utf-8")
-                  print(f"Applied {replaced_count} Russian UI strings from {custom_strings_file}")
+                  print(f"Applied {len(replaced_keys)} Russian UI strings from {custom_strings_file}")
           else:
               print("No localify-ru/strings.xml found in repo, keeping original UI strings")
 
@@ -540,12 +538,16 @@ jobs:
           hook_path = hook_files[0]
           hook_text = hook_path.read_text(encoding="utf-8")
 
-          h_lib_loaded = ru_dict.get("hook_lib_loaded", "Библиотека lib$nativeLibName.so загружена.")
-          h_lib_failed = ru_dict.get("hook_lib_failed", "Не удалось загрузить библиотеку lib$nativeLibName.so.")
-          h_warn_title = ru_dict.get("hook_warning_title", "Внимание")
-          h_ok_btn = ru_dict.get("hook_ok_btn", "ОК")
-          h_exit_btn = ru_dict.get("hook_exit_btn", "Выход")
-          h_mismatch_msg = ru_dict.get(
+          def get_hook_str(key: str, default: str) -> str:
+              val = ru_dict.get(key, default).strip()
+              return val.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+
+          h_lib_loaded = get_hook_str("hook_lib_loaded", "Библиотека lib$nativeLibName.so загружена.")
+          h_lib_failed = get_hook_str("hook_lib_failed", "Не удалось загрузить библиотеку lib$nativeLibName.so.")
+          h_warn_title = get_hook_str("hook_warning_title", "Внимание")
+          h_ok_btn = get_hook_str("hook_ok_btn", "ОК")
+          h_exit_btn = get_hook_str("hook_exit_btn", "Выход")
+          h_mismatch_msg = get_hook_str(
               "hook_version_mismatch_msg",
               "Обнаружено несовпадение версий плагина!\\n"
               "Встроенная в игру версия: $buildVersionName\\n"
@@ -553,17 +555,17 @@ jobs:
               "Это происходит, когда после выхода обновления вы установили только один из APK-файлов. "
               "Пожалуйста, скачайте и установите поверх актуальные версии обоих файлов (игры и Gakumas Localify RU)."
           )
-          h_err_info_title = ru_dict.get("hook_error_info_title", "Подробности ошибки")
-          h_cfg_title = ru_dict.get("hook_cfg_failed_title", "Ошибка чтения настроек")
-          h_cfg_msg = ru_dict.get(
+          h_err_info_title = get_hook_str("hook_error_info_title", "Подробности ошибки")
+          h_cfg_title = get_hook_str("hook_cfg_failed_title", "Ошибка чтения настроек")
+          h_cfg_msg = get_hook_str(
               "hook_cfg_failed_msg",
               "Не удалось загрузить настройки из плагина, будут использованы настройки по умолчанию.\\n"
               "Возможно, вы не установили приложение Gakumas Localify RU отдельно или запретили игре запуск других приложений.\\n"
               "Если приложение плагина не установлено — пожалуйста, скачайте и установите его.\\n"
               "Если оно уже установлено, но вы видите эту ошибку — разрешите игре запуск других приложений в настройках системы."
           )
-          h_info_btn = ru_dict.get("hook_info_btn", "Инфо")
-          h_dl_btn = ru_dict.get("hook_dl_btn", "Скачать")
+          h_info_btn = get_hook_str("hook_info_btn", "Инфо")
+          h_dl_btn = get_hook_str("hook_dl_btn", "Скачать")
 
           hook_text = hook_text.replace('showToast("lib$nativeLibName.so loaded.")', f'showToast("{h_lib_loaded}")')
           hook_text = hook_text.replace('showToast("Load native library lib$nativeLibName.so failed.")', f'showToast("{h_lib_failed}")')
@@ -611,7 +613,6 @@ jobs:
                       if not isinstance(members, list):
                           continue
 
-                      # Убираем дубликаты, если скрипт запускался повторно
                       members[:] = [m for m in members if isinstance(m, dict) and m.get("name") != "HunterKrendel234"]
 
                       if "trans" in gname.lower() or "译" in gname or "翻" in gname:
