@@ -862,3 +862,46 @@ jobs:
             }' > payload.json
 
           curl -s -H "Content-Type: application/json" -X POST -d @payload.json "$WEBHOOK_URL"
+      
+      - name: Send Telegram Notification
+        if: steps.compare.outputs.should_build == 'true'
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          CHANGES_MD: ${{ steps.compare.outputs.changes_md }}
+          DOWNLOAD_GUIDE_MD: ${{ steps.compare.outputs.download_guide_md }}
+        run: |
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${{ steps.compare.outputs.combined_tag }}"
+          GAME_DL="https://github.com/${{ github.repository }}/releases/download/${{ steps.compare.outputs.combined_tag }}/Gakumas-RU-${{ steps.gplay.outputs.game_ver }}.apk"
+          MANAGER_DL="https://github.com/${{ github.repository }}/releases/download/${{ steps.compare.outputs.combined_tag }}/Gakumas-Localify-RU.apk"
+          ORIG_LOCALIFY_URL="${{ steps.check_upstreams.outputs.plugin_html_url }}"
+          TRANS_REL_URL="${{ steps.check_upstreams.outputs.trans_html_url }}"
+
+          # Переводим разметку из Discord (**жирный**, `код`, *(курсив)*) в HTML для Telegram
+          TG_DESCRIPTION=$(printf "%s\n\n%s" "$CHANGES_MD" "$DOWNLOAD_GUIDE_MD" | \
+            sed -E 's/\*\*([^*]+)\*\*/<b>\1<\/b>/g; s/`([^`]+)`/<code>\1<\/code>/g; s/\*\(([^*]+)\)\*/<i>(\1)<\/i>/g')
+
+          TEXT=$(printf "<b><a href=\"%s\">Доступно обновление Gakumas RU (%s)</a></b>\n\n%s\n\n<b>Версия игры:</b> <code>%s</code>\n<b>Русский перевод:</b> <a href=\"%s\">%s</a>\n<b>Оригинал Localify:</b> <a href=\"%s\">%s</a>\n\n<b>Ссылки и скачивание</b>\n📦 <b><a href=\"%s\">Страница нашего релиза APK на GitHub</a></b>\n📲 <a href=\"%s\">Скачать готовый APK игры (Gakumas-RU.apk)</a>\n⚙️ <a href=\"%s\">Скачать менеджер Gakumas-Localify-RU.apk</a>\n🔗 <a href=\"%s\">Оригинальный репозиторий Localify (chinosk6)</a>" \
+            "$RELEASE_URL" "${{ steps.gplay.outputs.game_ver }}" \
+            "$TG_DESCRIPTION" \
+            "${{ steps.gplay.outputs.game_ver }}" \
+            "$TRANS_REL_URL" "${{ steps.check_upstreams.outputs.trans_tag }}" \
+            "$ORIG_LOCALIFY_URL" "${{ steps.check_upstreams.outputs.plugin_tag }}" \
+            "$RELEASE_URL" \
+            "$GAME_DL" \
+            "$MANAGER_DL" \
+            "$ORIG_LOCALIFY_URL")
+
+          jq -n \
+            --arg chat_id "$CHAT_ID" \
+            --arg text "$TEXT" \
+            '{
+              chat_id: $chat_id,
+              text: $text,
+              parse_mode: "HTML",
+              disable_web_page_preview: true
+            }' > tg_payload.json
+
+          curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d @tg_payload.json
